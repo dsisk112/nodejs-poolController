@@ -18,6 +18,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import * as winston from 'winston';
 import * as os from 'os';
+import { utils } from "../controller/Constants";
 import { Message } from '../controller/comms/messages/Messages';
 import { config } from '../config/Config';
 import { webApp } from '../web/Server';
@@ -36,9 +37,9 @@ class Logger {
     private pkts: Message[];
     private pktPath: string;
     private consoleToFilePath: string;
-    private transports: {console:winston.transports.ConsoleTransportInstance, file?:winston.transports.FileTransportInstance} = {
-        console: new winston.transports.Console({level:'silly'})
-    }
+    private transports: { console: winston.transports.ConsoleTransportInstance, file?: winston.transports.FileTransportInstance, consoleFile?: winston.transports.FileTransportInstance } = {
+        console: new winston.transports.Console({ level: 'silly' })
+    };
     private captureForReplayBaseDir: string;
     private captureForReplayPath: string;
     private pktTimer: NodeJS.Timeout;
@@ -71,11 +72,31 @@ class Logger {
         });
         this.transports.console.level = this.cfg.app.level;
         if (this.cfg.app.captureForReplay) this.startCaptureForReplay(false);
+        if (this.cfg.app.logToFile) {
+            this.transports.consoleFile = new winston.transports.File({
+                filename: path.join(process.cwd(), '/logs', this.getConsoleToFilePath()),
+                level: 'silly',
+                format: winston.format.combine(winston.format.splat(), winston.format.uncolorize(), this.myFormat)
+            });
+            this.transports.consoleFile.level = this.cfg.app.level;
+            this._logger.add(this.transports.consoleFile);
+        }
     }
     public async stopAsync() {
-        if (this.cfg.app.captureForReplay) {
-            return this.stopCaptureForReplayAsync();
-        }
+        try {
+            this.info(`Stopping logger Process.`);
+            if (this.cfg.app.captureForReplay) {
+                return await this.stopCaptureForReplayAsync();
+            }
+            // Free up the file handles.  This is yet another goofiness with winston.  Not sure why they
+            // need to exclusively lock the file handles when the process always appends.  Just stupid.
+            if (typeof this.transports.consoleFile !== 'undefined') {
+                this._logger.remove(this.transports.consoleFile);
+                this.transports.consoleFile.close();
+                this.transports.consoleFile = undefined;
+            }
+            console.log(`Logger Process Stopped`);
+        } catch (err) { console.log(`Error shutting down logger: ${err.message}`); }
     }
     public get options(): any { return this.cfg; }
     public info(...args: any[]) { logger._logger.info.apply(logger._logger, arguments); }
@@ -190,9 +211,26 @@ class Logger {
                 c[prop] = opts[prop];
         }
         config.setSection('log', this.cfg);
-        for (let [key,transport] of Object.entries(this.transports)){
-           transport.level = this.cfg.app.level; 
-       } 
+        if (utils.makeBool(this.cfg.app.logToFile)) {
+            if (typeof this.transports.consoleFile === 'undefined') {
+                this.transports.consoleFile = new winston.transports.File({
+                    filename: path.join(process.cwd(), '/logs', this.getConsoleToFilePath()),
+                    level: 'silly',
+                    format: winston.format.combine(winston.format.splat(), winston.format.uncolorize(), this.myFormat)
+                });
+                this._logger.add(this.transports.consoleFile);
+            }
+        }
+        else {
+            if (typeof this.transports.consoleFile !== 'undefined') {
+                this._logger.remove(this.transports.consoleFile);
+                this.transports.consoleFile.close();
+                this.transports.consoleFile = undefined;
+            }
+        }
+        for (let [key, transport] of Object.entries(this.transports)) {
+            if(typeof transport !== 'undefined') transport.level = this.cfg.app.level;
+        }
     }
     public startCaptureForReplay(bResetLogs:boolean) {
         logger.info(`Starting Replay Capture.`);

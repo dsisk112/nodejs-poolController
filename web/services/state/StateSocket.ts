@@ -15,7 +15,7 @@ You should have received a copy of the GNU Affero General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 import { state, ICircuitState, LightGroupState } from "../../../controller/State";
-import { sys } from "../../../controller/Equipment";
+import { sys, ChemController, Circuit, Feature } from "../../../controller/Equipment";
 import { utils } from '../../../controller/Constants';
 import { logger } from "../../../logger/Logger";
 import { ServiceParameterError } from "../../../controller/Errors";
@@ -71,6 +71,127 @@ export class StateSocket {
             try {
                 data = JSON.parse(data);
                 await sys.board.system.setTempsAsync(data).catch(err => logger.error(err));
+            }
+            catch (err) { logger.error(err); }
+        });
+        sock.on('/chlorinator', async (data: any) => {
+            try {
+                data = JSON.parse(data);
+                let id = parseInt(data.id, 10);
+                let chlor = sys.chlorinators.getItemById(id);
+                if (chlor.isActive) {
+                    let isBodyOn = sys.board.bodies.isBodyOn(chlor.body);
+                    let schlor = state.chlorinators.getItemById(id, true);
+                    // Ignore the salt level feed when the body is not on.
+                    if (isBodyOn) {
+                        if (typeof data.saltLevel !== 'undefined') {
+                            let saltLevel = parseInt(data.saltLevel, 10);
+                            if (!isNaN(saltLevel) && schlor.saltLevel !== saltLevel) {
+                                schlor.saltLevel = saltLevel;
+                            }
+                        }
+                    }
+                    if (typeof data.poolSetpoint !== 'undefined' || typeof data.spaSetpoint !== 'undefined') {
+                        sys.board.chlorinator.setChlorAsync(data);
+                    }
+                    schlor.emitEquipmentChange();
+                }
+            }
+            catch (err) { logger.error(err); }
+        });
+        sock.on('/chemController', async (data: any) => {
+            try {
+                //console.log(`chemController: ${data}`);
+                data = JSON.parse(data);
+                
+                // Get the chem controller.
+                let id = parseInt(data.id, 10);
+                let address = parseInt(data.address, 10);
+                let controller: ChemController;
+                if (!isNaN(id))
+                    controller = sys.chemControllers.getItemById(id);
+                else if (!isNaN(address))
+                    controller = sys.chemControllers.getItemByAddress(address);
+                if (typeof controller !== 'undefined' && controller.isActive === true) {
+                    let scontroller = state.chemControllers.getItemById(controller.id);
+                    let isBodyOn = scontroller.flowDetected; //sys.board.bodies.isBodyOn(controller.body);
+                    if (typeof data.pHLevel !== 'undefined') {
+                        if (!isNaN(parseFloat(data.pHLevel))) scontroller.ph.probe.level = parseFloat(data.pHLevel);
+                        else if (typeof data.pHLevel === 'object') {
+                            if (!isNaN(parseFloat(data.pHLevel.pH))) scontroller.ph.probe.level = parseFloat(data.pHLevel.pH);
+                            if (!isNaN(parseFloat(data.pHLevel.temperature))) scontroller.ph.probe.temperature = parseFloat(data.pHLevel.temperature);
+                            if (['C', 'F', 'c', 'f'].includes(data.pHLevel.tempUnits)) scontroller.ph.probe.tempUnits = data.pHLevel.tempUnits;
+                        }
+                        if (isBodyOn || !controller.ph.flowReadingsOnly) scontroller.ph.level = scontroller.ph.probe.level;
+                    }
+                    if (typeof data.orpLevel !== 'undefined') {
+                        if (!isNaN(parseFloat(data.orpLevel))) scontroller.orp.probe.level = parseFloat(data.orpLevel);
+                        else if (typeof data.orpLevel === 'object') {
+                            if (!isNaN(parseFloat(data.orpLevel.orp))) scontroller.orp.probe.level = parseFloat(data.orpLevel.orp);
+                        }
+                        if (isBodyOn || !controller.orp.flowReadingsOnly) scontroller.orp.level = scontroller.orp.probe.level;
+                    }
+                    if (typeof data.temperature !== 'undefined') scontroller.ph.probe.temperature = data.temperauture;
+                    if (typeof data.tempUnits !== 'undefined') scontroller.ph.probe.tempUnits = data.tempUnits;
+                    if (typeof data.acidTank !== 'undefined') {
+                        if (!isNaN(parseFloat(data.acidTank.level))) scontroller.ph.tank.level = parseFloat(data.acidTank.level);
+                        if (!isNaN(parseFloat(data.acidTank.capacity))) scontroller.ph.tank.capacity = controller.ph.tank.capacity = parseFloat(data.acidTank.capacity);
+                        if (typeof data.acidTank.units === 'string') scontroller.ph.tank.units = controller.ph.tank.units = data.acidTank.units;
+                    }
+                    if (typeof data.orpTank !== 'undefined') {
+                        if (!isNaN(parseFloat(data.orpTank.level))) scontroller.orp.tank.level = parseFloat(data.orpTank.level);
+                        if (!isNaN(parseFloat(data.orpTank.capacity))) scontroller.orp.tank.capacity = controller.orp.tank.capacity = parseFloat(data.orpTank.capacity);
+                        if (typeof data.orpTank.units === 'string') scontroller.orp.tank.units = controller.orp.tank.units = data.orpTank.units;
+                    }
+
+                    // Need to build this out to include the type of controller.  If this is Homegrown or REM Chem we
+                    // will send the whole rest of the nut over to it.  Intellichem will only let us
+                    // set specific values.
+                    if (controller.type === 3) {
+
+                    }
+                }
+            }
+            catch (err) { logger.error(err); }
+        });
+        sock.on('/circuit', async (data: any) => {
+            try {
+                data = JSON.parse(data);
+                let id = data.parseInt(data.id, 10);
+                if (!isNaN(id) && (typeof data.isOn !== 'undefined' || typeof data.state !== 'undefined')) {
+                    await sys.board.circuits.setCircuitStateAsync(id, utils.makeBool(data.isOn || typeof data.state));
+                }
+            }
+            catch (err) { logger.error(err); }
+        });
+        sock.on('/feature', async (data: any) => {
+            try {
+                data = JSON.parse(data);
+                let id = data.parseInt(data.id, 10);
+                if (!isNaN(id) && (typeof data.isOn !== 'undefined' || typeof data.state !== 'undefined')) {
+                    await sys.board.features.setFeatureStateAsync(id, utils.makeBool(data.isOn || typeof data.state));
+                }
+            }
+            catch (err) { logger.error(err); }
+        });
+        sock.on('/circuitGroup', async (data: any) => {
+            try {
+                data = JSON.parse(data);
+                let id = data.parseInt(data.id, 10);
+                if (!isNaN(id) && (typeof data.isOn !== 'undefined' || typeof data.state !== 'undefined')) {
+                    await sys.board.circuits.setCircuitGroupStateAsync(id, utils.makeBool(data.isOn || typeof data.state));
+                }
+            }
+            catch (err) { logger.error(err); }
+        });
+        sock.on('/lightGroup', async (data: any) => {
+            try {
+                data = JSON.parse(data);
+                let id = data.parseInt(data.id, 10);
+                if (!isNaN(id) && (typeof data.isOn !== 'undefined' || typeof data.state !== 'undefined')) {
+                    await sys.board.circuits.setLightGroupStateAsync(id, utils.makeBool(data.isOn || typeof data.state));
+                }
+                if (!isNaN(id) && typeof data.theme !== 'undefined') await sys.board.circuits.setLightGroupThemeAsync(id, data.theme);
             }
             catch (err) { logger.error(err); }
         });

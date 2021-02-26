@@ -14,14 +14,15 @@ GNU Affero General Public License for more details.
 You should have received a copy of the GNU Affero General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
-import {Inbound} from "../Messages";
-import {sys, Feature, Body, ICircuitGroup, LightGroup} from "../../../Equipment";
-import {state, BodyTempState, ICircuitGroupState, LightGroupState} from "../../../State";
+import { Inbound } from "../Messages";
+import { sys, Feature, Body, ICircuitGroup, LightGroup, CircuitGroup } from "../../../Equipment";
+import { state, BodyTempState, ICircuitGroupState, LightGroupState } from "../../../State";
+import { utils } from "../../../Constants";
 //import {setTimeout} from "timers";
 //import { exceptions, ExceptionHandler } from "winston";
 import { logger } from "../../../../logger/Logger";
 export class ExternalMessage {
-    public static process(msg: Inbound): void {
+    public static processIntelliCenter(msg: Inbound): void {
         switch (msg.extractPayloadByte(0)) {
             case 0: // Setpoints/HeatMode
                 ExternalMessage.processTempSettings(msg);
@@ -77,67 +78,104 @@ export class ExternalMessage {
         }
     }
     public static processIntelliChem(msg: Inbound) {
-        let controller = sys.chemControllers.getItemById(msg.extractPayloadByte(2) + 1);
-        controller.body = msg.extractPayloadByte(3);
-        controller.address = msg.extractPayloadByte(5);
-        controller.pHSetpoint = msg.extractPayloadInt(7) / 100;
-        controller.orpSetpoint = msg.extractPayloadInt(9);
-        controller.calciumHardness = msg.extractPayloadInt(13);
-        controller.cyanuricAcid = msg.extractPayloadInt(15);
-        controller.alkalinity = msg.extractPayloadInt(17);
+        let id = msg.extractPayloadByte(2) + 1;
+        let isActive = utils.makeBool(msg.extractPayloadByte(6));
+        //let scontroller = state.chemControllers.getItemById(id, isActive);
+        //controller.isActive = scontroller.isActive = isActive;
+        if (isActive) {
+            let controller = sys.chemControllers.getItemById(id, true);
+            let scontroller = state.chemControllers.getItemById(id, true);
+            controller.isVirtual = false;
+            controller.ph.tank.capacity = controller.orp.tank.capacity = 6;
+            controller.ph.tank.units = controller.orp.tank.units = '';
+            scontroller.type = controller.type = 2;
+            scontroller.name = controller.name = (controller.name || 'IntelliChem' + id);
+            scontroller.body = controller.body = msg.extractPayloadByte(3);
+            scontroller.address = controller.address = msg.extractPayloadByte(5);
+            controller.ph.setpoint = scontroller.ph.setpoint = msg.extractPayloadInt(7) / 100;
+            controller.orp.setpoint = scontroller.orp.setpoint = msg.extractPayloadInt(9);
+            controller.calciumHardness = msg.extractPayloadInt(13);
+            controller.cyanuricAcid = msg.extractPayloadInt(15);
+            controller.alkalinity = msg.extractPayloadInt(17);
+            //if (typeof scontroller.acidTankLevel === 'undefined') scontroller.acidTankLevel = 0;
+            //if (typeof scontroller.orpTankLevel === 'undefined') scontroller.orpTankLevel = 0;
+            //if (typeof scontroller.pHLevel === 'undefined') scontroller.pHLevel = 0;
+            //if (typeof scontroller.orpLevel === 'undefined') scontroller.orpLevel = 0;
+            //if (typeof scontroller.orpDosingTime === 'undefined') scontroller.orpDosingTime = 0;
+            //if (typeof scontroller.pHDosingTime === 'undefined') scontroller.orpDosingTime = 0;
+            //if (typeof scontroller.temp === 'undefined') scontroller.temp = 0;
+            //if (typeof scontroller.tempUnits === 'undefined') scontroller.tempUnits = 0;
+        }
+        else {
+            sys.chemControllers.removeItemById(id);
+            state.chemControllers.removeItemById(id);
+        }
+        msg.isProcessed = true;
     }
     public static processValve(msg: Inbound) {
         let valve = sys.valves.getItemById(msg.extractPayloadByte(2) + 1);
         valve.circuit = msg.extractPayloadByte(3) + 1;
         valve.name = msg.extractPayloadString(4, 16);
         valve.isVirtual = false;
+        msg.isProcessed = true;
     }
     public static processPool(msg: Inbound) {
         switch (msg.extractPayloadByte(2)) {
             case 0: // Pool Alias
                 sys.general.alias = msg.extractPayloadString(3, 16);
+                msg.isProcessed = true;
                 break;
             case 1: // Address
                 sys.general.location.address = msg.extractPayloadString(3, 32);
+                msg.isProcessed = true;
                 break;
             case 2: // Owner
                 sys.general.owner.name = msg.extractPayloadString(3, 16);
+                msg.isProcessed = true;
                 break;
             case 3: // Email
                 sys.general.owner.email = msg.extractPayloadString(3, 32);
+                msg.isProcessed = true;
                 break;
             case 4: // Email 2
                 sys.general.owner.email2 = msg.extractPayloadString(3, 32);
+                msg.isProcessed = true;
                 break;
             case 5: // Phone
                 sys.general.owner.phone = msg.extractPayloadString(3, 16);
+                msg.isProcessed = true;
                 break;
             case 6: // Phone 2
                 sys.general.owner.phone2 = msg.extractPayloadString(3, 16);
+                msg.isProcessed = true;
                 break;
             case 7: // Zipcode
                 sys.general.location.zip = msg.extractPayloadString(3, 6);
+                msg.isProcessed = true;
                 break;
             case 8: // Country
                 sys.general.location.country = msg.extractPayloadString(3, 16);
+                msg.isProcessed = true;
                 break;
             case 9: // City
                 sys.general.location.city = msg.extractPayloadString(3, 32);
+                msg.isProcessed = true;
                 break;
             case 10: // State
                 sys.general.location.state = msg.extractPayloadString(3, 16);
+                msg.isProcessed = true;
                 break;
             case 11: // Latitute
                 sys.general.location.latitude = ((msg.extractPayloadByte(4) * 256) + msg.extractPayloadByte(3)) / 100;
+                msg.isProcessed = true;
                 break;
             case 12: // Longitude
                 sys.general.location.longitude = -((msg.extractPayloadByte(4) * 256) + msg.extractPayloadByte(3)) / 100;
+                msg.isProcessed = true;
                 break;
             case 13: // Timezone
                 sys.general.location.timeZone = msg.extractPayloadByte(3);
-                break;
-            default:
-                logger.debug(`Unprocessed Config Message ${msg.toPacket()}`)
+                msg.isProcessed = true;
                 break;
         }
     }
@@ -161,27 +199,36 @@ export class ExternalMessage {
                             sys.circuitGroups.removeItemById(groupId);
                             sgroup.isActive = false;
                             state.emitEquipmentChanges();
+                            msg.isProcessed = true;
                             break;
                         case 1:
                             group = sys.lightGroups.getItemById(groupId, true);
                             sgroup = state.lightGroups.getItemById(groupId, true);
+                            sys.circuitGroups.removeItemById(groupId);
+                            state.circuitGroups.removeItemById(groupId);
                             sgroup.lightingTheme = group.lightingTheme = msg.extractPayloadByte(4) >> 2;
                             sgroup.type = group.type = type;
                             sgroup.isActive = group.isActive = true;
+                            msg.isProcessed = true;
                             break;
                         case 2:
                             group = sys.circuitGroups.getItemById(groupId, true);
                             sgroup = state.circuitGroups.getItemById(groupId, true);
                             sgroup.type = group.type = type;
+                            if (typeof group.showInFeatures === 'undefined') group.showInFeatures = sgroup.showInFeatures = true;
+                            sys.lightGroups.removeItemById(groupId);
+                            state.lightGroups.removeItemById(groupId);
                             sgroup.isActive = group.isActive = true;
+                            msg.isProcessed = true;
                             break;
                     }
                     if (group.isActive) {
                         for (let i = 0; i < 16; i++) {
                             let circuitId = msg.extractPayloadByte(i + 6);
-                            let circuit = group.circuits.getItemByIndex(i, circuitId !== 255);
-                            if (circuitId === 255) group.circuits.removeItemByIndex(i);
+                            let circuit = group.circuits.getItemById(i + 1, circuitId !== 255);
+                            if (circuitId === 255) group.circuits.removeItemById(i + 1);
                             circuit.circuit = circuitId + 1;
+
                         }
                     }
                     group.eggTimer = (msg.extractPayloadByte(38) * 60) + msg.extractPayloadByte(39);
@@ -190,10 +237,11 @@ export class ExternalMessage {
                     if (type === 1) {
                         let g = group as LightGroup;
                         for (let i = 0; i < 16; i++) {
-                            g.circuits.getItemByIndex(i).swimDelay = msg.extractPayloadByte(22 + i);
+                            g.circuits.getItemById(i + 1).swimDelay = msg.extractPayloadByte(22 + i);
                         }
                     }
                     state.emitEquipmentChanges();
+                    msg.isProcessed = true;
                     break;
                 }
             case 1:
@@ -203,13 +251,25 @@ export class ExternalMessage {
                 if (group.type === 1) {
                     let g = group as LightGroup;
                     for (let i = 0; i < 16; i++) {
-                        let circuit = g.circuits.getItemByIndex(i);
+                        let circuit = g.circuits.getItemById(i + 1);
                         circuit.color = msg.extractPayloadByte(i + 3);
                     }
                 }
                 state.emitEquipmentChanges();
+                msg.isProcessed = true;
                 break;
             case 2:
+                group = sys.circuitGroups.getInterfaceById(groupId);
+                // Process the group states.
+                if (group.type === 2) {
+                    let g = group as CircuitGroup;
+                    for (let i = 0; i < 16; i++) {
+                        let desiredState = msg.extractPayloadByte(i + 19);
+                        let circuit = g.circuits.getItemById(i + 1);
+                        circuit.desiredState = (desiredState !== 255) ? desiredState : 3;
+                    }
+                }
+                msg.isProcessed = true;
                 break;
         }
     }
@@ -218,19 +278,21 @@ export class ExternalMessage {
         ExternalMessage.processFeatureState(8, msg);
         ExternalMessage.processScheduleState(14, msg);
         ExternalMessage.processCircuitGroupState(12, msg);
-
     }
     private static processHeater(msg: Inbound) {
         // So a user is changing the heater info.  Lets
         // hijack it and get it ourselves.
         let heater = sys.heaters.getItemById(msg.extractPayloadByte(2) + 1);
-        heater.efficiencyMode = msg.extractPayloadByte(27);
         heater.type = msg.extractPayloadByte(3);
+        heater.body = msg.extractPayloadByte(4);
+        heater.cooldownDelay = msg.extractPayloadByte(5);
+        heater.startTempDelta = msg.extractPayloadByte(6);
+        heater.stopTempDelta = msg.extractPayloadByte(7);
+        heater.coolingEnabled = msg.extractPayloadByte(8) > 0;
+        heater.differentialTemp = msg.extractPayloadByte(9);
         heater.address = msg.extractPayloadByte(10);
         heater.name = msg.extractPayloadString(11, 16);
-        heater.body = msg.extractPayloadByte(4);
-        heater.differentialTemp = msg.extractPayloadByte(5);
-        heater.coolingEnabled = msg.extractPayloadByte(8) > 0;
+        heater.efficiencyMode = msg.extractPayloadByte(27);
         heater.maxBoostTemp = msg.extractPayloadByte(28);
         heater.economyTime = msg.extractPayloadByte(29);
         if (heater.type === 0) {
@@ -244,15 +306,15 @@ export class ExternalMessage {
             hstate.name = heater.name;
             hstate.type = heater.type;
         }
-        
+
         sys.board.heaters.updateHeaterServices();
         // Check anyway to make sure we got it all.
         //setTimeout(() => sys.checkConfiguration(), 500);
+        msg.isProcessed = true;
     }
 
     private static processCircuitState(start: number, msg: Inbound) {
-        let circuitId = sys.board.equipmentIds.circuits.start;
-        let body = 0; // Off
+        let circuitId = 1;//sys.board.equipmentIds.circuits.start;
         for (let i = start; i < msg.payload.length && sys.board.equipmentIds.circuits.isInRange(circuitId); i++) {
             let byte = msg.extractPayloadByte(i);
             // Shift each bit getting the circuit identified by each value.
@@ -264,8 +326,8 @@ export class ExternalMessage {
                     cstate.name = circuit.name;
                     cstate.showInFeatures = circuit.showInFeatures;
                     cstate.type = circuit.type;
-/*                     if (cstate.isOn && circuit.type === 12) body = 6;
-                    if (cstate.isOn && circuit.type === 13) body = 1; */
+                    /*                     if (cstate.isOn && circuit.type === 12) body = 6;
+                                        if (cstate.isOn && circuit.type === 13) body = 1; */
                     switch (circuit.type) {
                         case 6: // Globrite
                         case 5: // Magicstream
@@ -283,6 +345,7 @@ export class ExternalMessage {
                 state.emitEquipmentChanges();
                 circuitId++;
             }
+            msg.isProcessed = true;
         }
         // state.body = body;
     }
@@ -296,7 +359,6 @@ export class ExternalMessage {
                 if (schedule.isActive) {
                     if (schedule.circuit > 0) { // Don't get the schedule state if we haven't determined the entire config for it yet.
                         let sstate = state.schedules.getItemById(scheduleId, schedule.isActive);
-                        //if (scheduleId > 3) console.log(sstate);
                         sstate.isOn = ((byte & (1 << (j))) >> j) > 0;
                         sstate.circuit = schedule.circuit;
                         sstate.endTime = schedule.endTime;
@@ -310,12 +372,13 @@ export class ExternalMessage {
                         sstate.endTimeType = schedule.endTimeType;
                     }
                 }
-                else 
+                else
                     state.schedules.removeItemById(scheduleId);
                 scheduleId++;
             }
         }
         state.emitEquipmentChanges();
+        msg.isProcessed = true;
     }
     public static processFeatureState(start: number, msg: Inbound) {
         let featureId = sys.board.equipmentIds.features.start;
@@ -338,6 +401,8 @@ export class ExternalMessage {
             }
         }
         state.emitEquipmentChanges();
+        msg.isProcessed = true;
+
     }
     private static processCircuitGroupState(start: number, msg: Inbound) {
         let groupId = sys.board.equipmentIds.circuitGroups.start;
@@ -391,6 +456,7 @@ export class ExternalMessage {
             }
         }
         state.emitEquipmentChanges();
+        msg.isProcessed = true;
     }
 
     private static processBodies(msg: Inbound) {
@@ -408,6 +474,7 @@ export class ExternalMessage {
                 cbody = sys.bodies.getItemById(bodyId);
                 cbody.name = msg.extractPayloadString(3, 16);
                 state.temps.bodies.getItemById(bodyId, false).name = cbody.name;
+                msg.isProcessed = true;
                 break;
             case 4:
             case 5:
@@ -419,12 +486,16 @@ export class ExternalMessage {
                 else if (bodyId === 3) bodyId = 4;
                 cbody = sys.bodies.getItemById(bodyId);
                 cbody.capacity = msg.extractPayloadByte(3) * 1000;
+                msg.isProcessed = true;
                 break;
             case 13: // Pump notifications
+                msg.isProcessed = true;
                 break;
             case 14: // Heater notifications
+                msg.isProcessed = true;
                 break;
             case 15: // Chlorinator notifications
+                msg.isProcessed = true;
                 break;
         }
         state.emitEquipmentChanges();
@@ -448,13 +519,14 @@ export class ExternalMessage {
         if ((byte & 16 & 0xFF) === 16) cfg.endTimeType = 1;
         else if ((byte & 32 & 0xFF) === 32) cfg.endTimeType = 2;
         else cfg.endTimeType = 0;
-        cfg.runOnce = byte;
+        //cfg.runOnce = byte;
         cfg.scheduleDays = msg.extractPayloadByte(9);
         cfg.startMonth = msg.extractPayloadByte(10);
         cfg.startDay = msg.extractPayloadByte(11);
         cfg.startYear = msg.extractPayloadByte(12);
         let hs = msg.extractPayloadByte(13);
-        if (hs === 1) hs = 0; // Shim for 1.047
+        // RKS: During the transition to 1.047 the heat sources were all screwed up.  O now means no change and 1 means off.
+        //if (hs === 1) hs = 0; // Shim for 1.047
         cfg.heatSource = hs;
         cfg.heatSetpoint = msg.extractPayloadByte(14);
         cfg.flags = msg.extractPayloadByte(15);
@@ -480,6 +552,7 @@ export class ExternalMessage {
             s.emitEquipmentChange();
         }
         state.emitEquipmentChanges();
+        msg.isProcessed = true;
     }
     private static processChlorinator(msg: Inbound) {
         let isActive = msg.extractPayloadByte(10) > 0;
@@ -490,19 +563,25 @@ export class ExternalMessage {
             sys.chlorinators.removeItemById(chlorId);
             state.chlorinators.removeItemById(chlorId);
             s.emitEquipmentChange();
+            msg.isProcessed = true;
             return;
         }
         else {
 
             cfg.body = msg.extractPayloadByte(3);
             cfg.poolSetpoint = msg.extractPayloadByte(5);
-            cfg.spaSetpoint = msg.extractPayloadByte(6);
-            cfg.superChlor = msg.extractPayloadByte(7) > 0;
+            if (!cfg.disabled) {
+                // RKS: We don't want theses setpoints if our chem controller
+                // disabled the chlorinator.
+                cfg.spaSetpoint = msg.extractPayloadByte(6);
+                cfg.superChlor = msg.extractPayloadByte(7) > 0;
+            }
             cfg.superChlorHours = msg.extractPayloadByte(8);
             s.poolSetpoint = cfg.poolSetpoint;
             s.spaSetpoint = cfg.spaSetpoint;
             s.superChlorHours = cfg.superChlorHours;
             s.body = cfg.body;
+            msg.isProcessed = true;
         }
         state.emitEquipmentChanges();
     }
@@ -536,7 +615,7 @@ export class ExternalMessage {
             }
             else if (cpump.type === 1) {
                 cpump.circuits.clear();
-                cpump.circuits.add({id: 1, body: msg.extractPayloadByte(18)});
+                cpump.circuits.add({ id: 1, body: msg.extractPayloadByte(18) });
             }
             if (cpump.type === 0) {
                 sys.pumps.removeItemById(cpump.id);
@@ -561,6 +640,7 @@ export class ExternalMessage {
             }
             spump.emitData('pumpExt', spump.getExtended()); // Do this so clients can delete them.
         }
+        msg.isProcessed = true;
     }
     private static processFeature(msg: Inbound) {
         let featureId = msg.extractPayloadByte(2) + sys.board.equipmentIds.features.start;
@@ -581,6 +661,7 @@ export class ExternalMessage {
             fstate.showInFeatures = feature.showInFeatures = msg.extractPayloadByte(5) > 0;
         }
         state.emitEquipmentChanges();
+        msg.isProcessed = true;
     }
     private static processCircuit(msg: Inbound) {
         let circuitId = msg.extractPayloadByte(2) + 1;
@@ -608,8 +689,10 @@ export class ExternalMessage {
                 break;
         }
         state.emitEquipmentChanges();
+        msg.isProcessed = true;
     }
     private static processTempSettings(msg: Inbound) {
+        let fnTranslateByte = (byte: number) => { return (byte & 0x007F) * (((byte & 0x0080) > 0) ? -1 : 1); }
         // What the developers did is supply an offset index into the payload for the byte that is
         // changing.  I suppose this may have been easier but we are not using that logic.  We want the
         // information to remain decoded so that we aren't guessing which byte does what.
@@ -617,92 +700,157 @@ export class ExternalMessage {
         let body: Body = null;
         switch (msg.extractPayloadByte(2)) {
             case 0: // Water Sensor 2 Adj
-                sys.general.options.waterTempAdj2 = (msg.extractPayloadByte(3) & 0x007F) * (((msg.extractPayloadByte(3) & 0x0080) > 0) ? -1 : 1);
+                sys.equipment.tempSensors.setCalibration('water2', fnTranslateByte(msg.extractPayloadByte(3)));
+                msg.isProcessed = true;
                 break;
             case 1: // Water Sensor 1 Adj
-                sys.general.options.waterTempAdj1 = (msg.extractPayloadByte(4) & 0x007F) * (((msg.extractPayloadByte(4) & 0x0080) > 0) ? -1 : 1);
+                sys.equipment.tempSensors.setCalibration('water1', fnTranslateByte(msg.extractPayloadByte(4)));
+                msg.isProcessed = true;
                 break;
             case 2: // Solar Sensor 1 Adj
-                sys.general.options.solarTempAdj1 = (msg.extractPayloadByte(5) & 0x007F) * (((msg.extractPayloadByte(5) & 0x0080) > 0) ? -1 : 1);
+                sys.equipment.tempSensors.setCalibration('solar1', fnTranslateByte(msg.extractPayloadByte(5)));
+                msg.isProcessed = true;
                 break;
             case 3: // Air Sensor Adj
-                sys.general.options.airTempAdj = (msg.extractPayloadByte(6) & 0x007F) * (((msg.extractPayloadByte(6) & 0x0080) > 0) ? -1 : 1);
+                sys.equipment.tempSensors.setCalibration('air', fnTranslateByte(msg.extractPayloadByte(6)));
+                msg.isProcessed = true;
                 break;
             case 4: // Water Sensor 2 Adj
-                sys.general.options.waterTempAdj2 = (msg.extractPayloadByte(7) & 0x007F) * (((msg.extractPayloadByte(7) & 0x0080) > 0) ? -1 : 1);
+                sys.equipment.tempSensors.setCalibration('water2', fnTranslateByte(msg.extractPayloadByte(7)));
+                msg.isProcessed = true;
                 break;
             case 5: // Solar Sensor 2 Adj
-                sys.general.options.solarTempAdj2 = (msg.extractPayloadByte(8) & 0x007F) * (((msg.extractPayloadByte(8) & 0x0080) > 0) ? -1 : 1);
+                sys.equipment.tempSensors.setCalibration('solar2', fnTranslateByte(msg.extractPayloadByte(8)));
+                msg.isProcessed = true;
+                break;
+            case 6: // Water Sensor 3 Adj
+                sys.equipment.tempSensors.setCalibration('water3', fnTranslateByte(msg.extractPayloadByte(9)));
+                msg.isProcessed = true;
+                break;
+            case 7: // Solar Sensor 3 Adj
+                sys.equipment.tempSensors.setCalibration('solar3', fnTranslateByte(msg.extractPayloadByte(10)));
+                msg.isProcessed = true;
+                break;
+            case 8: // Water Sensor 4 Adj
+                sys.equipment.tempSensors.setCalibration('water4', fnTranslateByte(msg.extractPayloadByte(11)));
+                msg.isProcessed = true;
+                break;
+            case 9: // Solar Sensor 4 Adj
+                sys.equipment.tempSensors.setCalibration('water4', fnTranslateByte(msg.extractPayloadByte(12)));
+                msg.isProcessed = true;
                 break;
             case 11: // Clock mode
                 sys.general.options.clockMode = (msg.extractPayloadByte(14) & 0x0001) == 1 ? 24 : 12;
+                msg.isProcessed = true;
                 break;
             case 14: // Clock source
                 if ((msg.extractPayloadByte(17) & 0x0040) === 1)
                     sys.general.options.clockSource = 'internet';
                 else if (sys.general.options.clockSource !== 'server')
                     sys.general.options.clockSource = 'manual';
+                msg.isProcessed = true;
                 break;
             case 18: // Body 1 Setpoint
                 body = sys.bodies.getItemById(1, false);
                 body.setPoint = msg.extractPayloadByte(21);
                 state.temps.bodies.getItemById(1).setPoint = body.setPoint;
                 state.emitEquipmentChanges();
+                msg.isProcessed = true;
                 break;
             case 19: // Body 3 Setpoint
                 body = sys.bodies.getItemById(3, false);
                 body.setPoint = msg.extractPayloadByte(22);
                 state.temps.bodies.getItemById(3).setPoint = body.setPoint;
                 state.emitEquipmentChanges();
+                msg.isProcessed = true;
                 break;
             case 20: // Body 2 Setpoint
                 body = sys.bodies.getItemById(2, false);
                 body.setPoint = msg.extractPayloadByte(23);
                 state.temps.bodies.getItemById(2).setPoint = body.setPoint;
                 state.emitEquipmentChanges();
+                msg.isProcessed = true;
                 break;
             case 21: // Body 4 Setpoint
                 body = sys.bodies.getItemById(4, false);
                 body.setPoint = msg.extractPayloadByte(24);
                 state.temps.bodies.getItemById(4).setPoint = body.setPoint;
                 state.emitEquipmentChanges();
+                msg.isProcessed = true;
                 break;
             case 22: // Body 1 Heat Mode
                 body = sys.bodies.getItemById(1, false);
                 body.heatMode = msg.extractPayloadByte(25);
                 state.temps.bodies.getItemById(1).heatMode = body.heatMode;
                 state.emitEquipmentChanges();
+                msg.isProcessed = true;
                 break;
             case 23: // Body 2 Heat Mode
                 body = sys.bodies.getItemById(2, false);
                 body.heatMode = msg.extractPayloadByte(26);
                 state.temps.bodies.getItemById(2).heatMode = body.heatMode;
                 state.emitEquipmentChanges();
+                msg.isProcessed = true;
                 break;
             case 24: // Body 3 Heat Mode
                 body = sys.bodies.getItemById(3, false);
                 body.heatMode = msg.extractPayloadByte(27);
                 state.temps.bodies.getItemById(3).heatMode = body.heatMode;
                 state.emitEquipmentChanges();
+                msg.isProcessed = true;
                 break;
             case 25: // Body 4 Heat Mode
                 body = sys.bodies.getItemById(4, false);
                 body.heatMode = msg.extractPayloadByte(28);
                 state.temps.bodies.getItemById(4).heatMode = body.heatMode;
                 state.emitEquipmentChanges();
+                msg.isProcessed = true;
                 break;
             case 27: // Pump Valve Delay
                 sys.general.options.pumpDelay = msg.extractPayloadByte(30) !== 0;
+                msg.isProcessed = true;
                 break;
             case 28: // Cooldown Delay
                 sys.general.options.cooldownDelay = msg.extractPayloadByte(31) !== 0;
+                msg.isProcessed = true;
                 break;
             case 36: // Manual Priority
                 sys.general.options.manualPriority = msg.extractPayloadByte(39) !== 0;
+                msg.isProcessed = true;
                 break;
             case 37: // Manual Heat
                 sys.general.options.manualHeat = msg.extractPayloadByte(40) !== 0;
+                msg.isProcessed = true;
                 break;
+        }
+    }
+    public static processTouchChlorinator(msg: Inbound) {
+        let isActive = (msg.extractPayloadByte(0) & 0x01) === 1;
+        let chlor = sys.chlorinators.getItemById(1, isActive);
+        let schlor = state.chlorinators.getItemById(1, isActive);
+        chlor.isActive = schlor.isActive = isActive;
+        if (isActive) {
+            if (!chlor.disabled) {
+                // RKS: We don't want these setpoints if our chem controller disabled the
+                // chlorinator.  These should be 0 anyway.
+                schlor.poolSetpoint = chlor.spaSetpoint = msg.extractPayloadByte(0) >> 1;
+                schlor.spaSetpoint = chlor.poolSetpoint = msg.extractPayloadByte(1);
+                chlor.address = chlor.id + 79;
+                schlor.body = chlor.body = sys.equipment.maxBodies >= 1 || sys.equipment.shared === true ? 32 : 0;
+            }
+            schlor.superChlor = chlor.superChlor = msg.extractPayloadByte(2) - 128 > 0;
+            if (schlor.superChlor) {
+                schlor.superChlorRemaining = (msg.extractPayloadByte(2) - 128) * 3600;
+            }
+            else {
+                schlor.superChlorRemaining = 0;
+            }
+            if (state.temps.bodies.getItemById(1).isOn) schlor.targetOutput = chlor.disabled ? 0 : chlor.poolSetpoint;
+            else if (state.temps.bodies.getItemById(2).isOn) schlor.targetOutput = chlor.disabled ? 0 : chlor.spaSetpoint;
+        }
+        else {
+            sys.chlorinators.removeItemById(1);
+            state.chlorinators.removeItemById(1);
         }
     }
 }

@@ -14,15 +14,15 @@ GNU Affero General Public License for more details.
 You should have received a copy of the GNU Affero General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
+import { O_DSYNC } from 'constants';
 import { IntelliCenterBoard } from 'controller/boards/IntelliCenterBoard';
 
 import { logger } from '../../../../logger/Logger';
 import { ControllerType } from '../../../Constants';
 import { Body, Circuit, ExpansionPanel, Feature, Heater, sys } from '../../../Equipment';
-import { BodyTempState, state } from '../../../State';
+import { BodyTempState, ScheduleState, State, state } from '../../../State';
 import { ExternalMessage } from '../config/ExternalMessage';
 import { Inbound, Message } from '../Messages';
-
 
 export class EquipmentStateMessage {
     private static initIntelliCenter(msg: Inbound) {
@@ -62,10 +62,10 @@ export class EquipmentStateMessage {
                 sys.board.equipmentIds.invalidIds.merge([5, 7, 8, 9, 13, 14, 15, 16, 17, 18])
                 sys.equipment.maxCircuitGroups = 0;
                 break;
-            case 0:
+            case 0: // Intellitouch i5+3
                 sys.controllerType = ControllerType.IntelliTouch;
                 sys.equipment.maxPumps = 8; // All IntelliTouch systems can support 8VF pumps or 4VS and 4VF pumps.
-                sys.equipment.model = 'IntelliTouch i5+3S';
+                sys.equipment.model = 'IntelliTouch i5+3';
                 sys.equipment.maxBodies = 2;
                 sys.equipment.maxFeatures = 10;
                 sys.equipment.maxValves = 4; // This needs to be looked at as 3 additional valves can be added with the valve expansion.
@@ -160,26 +160,17 @@ export class EquipmentStateMessage {
                         sys.equipment.maxBodies = 2;
                         // AuxExtra (20) is valid if not used with solar
                         // Thus, valid features can be 11,12,13,14 and 20
-                        // See #113
-                        // exclude Aux4-Aux7, Feature 5-8
-                        sys.board.equipmentIds.invalidIds.merge([5, 7, 8, 9, 15, 16, 17, 18])
+                        // See #113, 244
+                        // exclude Aux5-Aux7
+                        sys.board.equipmentIds.invalidIds.merge([7, 8, 9])
                         break;
                     case 3:
                         sys.equipment.model = 'EasyTouch2 4P';
                         // AuxExtra (20) is valid if not used with solar
                         // Thus, valid features can be 11,12,13,14 and 20
                         // See #113
-                        // exclude Aux4-Aux7, Feature 5-8
-                        sys.board.equipmentIds.invalidIds.merge([5, 7, 8, 9, 15, 16, 17, 18])
-                        break;
-                    case 5: // EasyTouch PL4?? Complete guess.  If we see it; change the case.
-                        sys.equipment.model = 'EasyTouch PL4'; // SINGLE BODY; POOL ONLY
-                        sys.equipment.maxBodies = 1;
-                        sys.equipment.maxPumps = 1;
-                        sys.equipment.maxSchedules = 4;
-                        sys.equipment.maxFeatures = 2;
-                        // exclude Aux4-Aux7, Feature 3-8
-                        sys.board.equipmentIds.invalidIds.merge([5, 7, 8, 9, 13, 14, 15, 16, 17, 18])
+                        // exclude Aux5-Aux7
+                        sys.board.equipmentIds.invalidIds.merge([7, 8, 9])
                         break;
                     case 6:
                         sys.equipment.model = 'EasyTouch PSL4'; // POOL AND SPA
@@ -187,8 +178,17 @@ export class EquipmentStateMessage {
                         sys.equipment.maxPumps = 1;
                         sys.equipment.maxSchedules = 4;
                         sys.equipment.maxFeatures = 2;
-                        // exclude Aux4-Aux7, Feature 3-8
-                        sys.board.equipmentIds.invalidIds.merge([5, 7, 8, 9, 13, 14, 15, 16, 17, 18])
+                        // exclude Aux5-Aux7
+                        sys.board.equipmentIds.invalidIds.merge([7, 8, 9])
+                        break;
+                    case 7: // EasyTouch PL4 P/N 522523
+                        sys.equipment.model = 'EasyTouch PL4'; // SINGLE BODY; POOL ONLY
+                        sys.equipment.maxBodies = 1;
+                        sys.equipment.maxPumps = 1;
+                        sys.equipment.maxSchedules = 4;
+                        sys.equipment.maxFeatures = 2;
+                        // exclude Aux5-Aux7
+                        sys.board.equipmentIds.invalidIds.merge([7, 8, 9])
                         break;
                 }
                 break;
@@ -268,6 +268,23 @@ export class EquipmentStateMessage {
         heater.name = "Gas Heater";
         sys.equipment.shared ? heater.body = 32 : heater.body = 0;
         sys.equipment.setEquipmentIds();
+        // Initialize the bodies.  We will need these very soon.
+        for (let i = 1; i <= sys.equipment.maxBodies; i++) {
+            // Add in the bodies for the configuration.  These need to be set.
+            let cbody = sys.bodies.getItemById(i, true);
+            let tbody = state.temps.bodies.getItemById(i, true);
+            // If the body doesn't represent a spa then we set the type.
+            tbody.type = cbody.type = i > 1 && !sys.equipment.shared ? 1 : 0;
+            cbody.isActive = true;
+            if (typeof cbody.name === 'undefined') {
+                let bt = sys.board.valueMaps.bodyTypes.transform(cbody.type);
+                tbody.name = cbody.name = bt.name;
+            }
+        }
+        if (!sys.equipment.shared && !sys.equipment.dual) {
+            sys.bodies.removeItemById(2);
+            state.temps.bodies.removeItemById(2);
+        }
         sys.board.heaters.initTempSensors();
         // time defaults
         sys.general.options.clockMode = sys.general.options.clockMode || 12;
@@ -290,7 +307,7 @@ export class EquipmentStateMessage {
         let pool = sys.circuits.getItemById(6, true);
         let spool = state.circuits.getItemById(6, true);
         pool.name = spool.name = 'Pool';
-        pool.type = spool.type = 6;
+        pool.type = spool.type = 2;
         pool.isActive = true;
         spool.isOn = false;
         const cbody = sys.bodies.getItemById(1, true, { id: 1, isActive: true, name: "Pool" });
@@ -316,7 +333,7 @@ export class EquipmentStateMessage {
         const model1 = msg.extractPayloadByte(27);
         const model2 = msg.extractPayloadByte(28);
         // RKS: 06-15-20 -- While this works for now the way we are detecting seems a bit dubious.  First, the 2 status message
-        // contains two model bytes.  Right now the ones witness in the wild include 23 = fw1.023, 40 = fw1.040, 47 = fw1.047 beta.
+        // contains two model bytes.  Right now the ones witness in the wild include 23 = fw1.023, 40 = fw1.040, 47 = fw1.047.
         if (model2 === 0 && (model1 === 23 || model1 >= 40)) {
             state.equipment.controllerType = 'intellicenter';
             sys.controllerType = ControllerType.IntelliCenter;
@@ -334,19 +351,25 @@ export class EquipmentStateMessage {
         Message.headerSubByte = msg.header[1];
         //console.log(process.memoryUsage());
         if (!state.isInitialized) {
+            msg.isProcessed = true;
             if (msg.action === 2) EquipmentStateMessage.initController(msg);
             else return;
         }
         else if (!sys.board.modulesAcquired) {
+            msg.isProcessed = true;
             if (msg.action === 204) {
                 let board = sys.board as IntelliCenterBoard;
                 // We have determined that the 204 message now contains the information
                 // related to the installed expansion boards.
                 console.log(`INTELLICENTER MODULES DETECTED, REQUESTING STATUS!`);
+                // Master = 13-14
+                // EXP1 = 15-16
+                // EXP2 = 17-18
+                let pc = msg.extractPayloadByte(40);
                 board.initExpansionModules(msg.extractPayloadByte(13), msg.extractPayloadByte(14),
-                    msg.extractPayloadByte(15),
-                    msg.extractPayloadByte(16),
-                    msg.extractPayloadByte(17));
+                    pc & 0x01 ? msg.extractPayloadByte(15) : 0x00, pc & 0x01 ? msg.extractPayloadByte(16) : 0x00,
+                    pc & 0x02 ? msg.extractPayloadByte(17) : 0x00, pc & 0x02 ? msg.extractPayloadByte(18) : 0x00,
+                    pc & 0x04 ? msg.extractPayloadByte(19) : 0x00, pc & 0x04 ? msg.extractPayloadByte(20) : 0x00);
                 sys.equipment.setEquipmentIds();
             }
             else return;
@@ -354,13 +377,20 @@ export class EquipmentStateMessage {
         switch (msg.action) {
             case 2:
                 {
+                    let fnTempFromByte = function (byte) {
+                        return byte;
+                        //return (byte & 0x007F) * (((byte & 0x0080) > 0) ? -1 : 1); // RKS: 09-26-20 Not sure how negative temps are represented but this aint it.  Temps > 127 have been witnessed.
+                    }
+
                     // Shared
                     let dt = new Date();
                     if (state.chemControllers.length > 0) {
                         // TODO: move this to chemController when we understand the packets better
                         for (let i = 0; i < state.chemControllers.length; i++) {
                             let ccontroller = state.chemControllers.getItemByIndex(i);
-                            if (dt.getTime() - ccontroller.lastComm > 60000) ccontroller.status = 1;
+                            if (sys.board.valueMaps.chemControllerTypes.getName(ccontroller.type) === 'intellichem') {
+                                if (dt.getTime() - ccontroller.lastComm > 60000) ccontroller.status = 1;
+                            }
                         }
                     }
                     state.time.hours = msg.extractPayloadByte(0);
@@ -395,13 +425,11 @@ export class EquipmentStateMessage {
                     state.delay = msg.extractPayloadByte(12) & 63; // not sure what 64 val represents
                     state.freeze = (msg.extractPayloadByte(9) & 0x08) === 0x08;
                     if (sys.controllerType === ControllerType.IntelliCenter) {
-                        let sensor = sys.equipment.tempSensors.getItemById('water1');
-                        state.temps.waterSensor1 = msg.extractPayloadByte(14) + sys.equipment.tempSensors.getCalibration('water1');
-                        if (sys.bodies.length > 2)
-                            state.temps.waterSensor2 = msg.extractPayloadByte(15) + sys.equipment.tempSensors.getCalibration('water2');
+                        state.temps.waterSensor1 = fnTempFromByte(msg.extractPayloadByte(14));
+                        if (sys.bodies.length > 2 || sys.equipment.dual) state.temps.waterSensor2 = fnTempFromByte(msg.extractPayloadByte(15));
                         // We are making an assumption here in that the circuits are always labeled the same.
-                        // 1=Spa
-                        // 6=Pool
+                        // 1=Spa/Body2
+                        // 6=Pool/Body1
                         // 12=Body3
                         // 22=Body4 -- Really not sure about this one.
                         if (sys.bodies.length > 0) {
@@ -432,6 +460,7 @@ export class EquipmentStateMessage {
                             } else tbody.isOn = false;
                         }
                         if (sys.bodies.length > 2) {
+                            state.temps.waterSensor3 = fnTempFromByte(msg.extractPayloadByte(20));
                             // const tbody: BodyTempState = state.temps.bodies.getItemById(10, true);
                             const tbody: BodyTempState = state.temps.bodies.getItemById(3, true);
                             const cbody: Body = sys.bodies.getItemById(3);
@@ -442,11 +471,12 @@ export class EquipmentStateMessage {
                             tbody.circuit = cbody.circuit = 12;
                             if ((msg.extractPayloadByte(3) & 0x08) === 8) {
                                 // This is the first circuit on the second body.
-                                tbody.temp = state.temps.waterSensor2;
+                                tbody.temp = state.temps.waterSensor3;
                                 tbody.isOn = true;
                             } else tbody.isOn = false;
                         }
                         if (sys.bodies.length > 3) {
+                            state.temps.waterSensor4 = fnTempFromByte(msg.extractPayloadByte(21));
                             // const tbody: BodyTempState = state.temps.bodies.getItemById(19, true);
                             const tbody: BodyTempState = state.temps.bodies.getItemById(4, true);
                             const cbody: Body = sys.bodies.getItemById(4);
@@ -461,13 +491,44 @@ export class EquipmentStateMessage {
                                 tbody.isOn = true;
                             } else tbody.isOn = false;
                         }
-                        state.temps.air = msg.extractPayloadByte(18) + sys.equipment.tempSensors.getCalibration('air'); // 18
-                        state.temps.solar = msg.extractPayloadByte(19) + sys.equipment.tempSensors.getCalibration('solar1'); // 19
+                        state.temps.air = fnTempFromByte(msg.extractPayloadByte(18)); // 18
+                        state.temps.solarSensor1 = fnTempFromByte(msg.extractPayloadByte(19)); // 19
+                        if (sys.bodies.length > 2 || sys.equipment.dual)
+                            state.temps.solarSensor2 = fnTempFromByte(msg.extractPayloadByte(17));
+                        if ((sys.bodies.length > 2))
+                            state.temps.solarSensor3 = fnTempFromByte(msg.extractPayloadByte(22));
+                        if ((sys.bodies.length > 3))
+                            state.temps.solarSensor4 = fnTempFromByte(msg.extractPayloadByte(23));
+
                         if (sys.general.options.clockSource !== 'server' || typeof sys.general.options.adjustDST === 'undefined') sys.general.options.adjustDST = (msg.extractPayloadByte(23) & 0x01) === 0x0; //23
                     }
                     else {
-                        state.temps.waterSensor1 = msg.extractPayloadByte(14);
-                        if (sys.bodies.length > 2) state.temps.waterSensor2 = msg.extractPayloadByte(15);
+                        state.temps.waterSensor1 = fnTempFromByte(msg.extractPayloadByte(14));
+                        state.temps.air = fnTempFromByte(msg.extractPayloadByte(18));
+                        let solar: Heater = sys.heaters.getItemById(2);
+                        if (solar.isActive) state.temps.solar = fnTempFromByte(msg.extractPayloadByte(19));
+                        // Heat Modes
+                        // 1 = Heater
+                        // 2 = Solar Preferred
+                        // 3 = Solar Only
+
+                        // Pool Heat Mode.
+                        // When temp setpoint and pool in heater mode went above the current pool temp byte 10 went from 67 to 71.  The upper two bits of the
+                        // lower nibble changed on bit 3.  So 0100 0111 from 0100 0011
+
+                        // Spa Heat Mode
+                        // When switching from pool to spa with both heat modes set to off byte 10 went from 67 to 75 and byte(16) changed from 0 to 32.  The upper two bits of the lower nibble
+                        // changed on byte(10) bit 4.  So to 0100 1011 from 0100 0011.  Interestingly this seems to indicate that the spa turned on.  This almost appears as if the heater engaged
+                        // automatically like the spa has manual heat turned off.
+                        // When the heat mode was changed to solar only byte 10 went to 75 from 67 so bit 4 switched off and byte(16) changed to 0.  At this point the water temp is 86 and the
+                        // solar temp is 79 so the solar should not be coming on.
+                        // When the setpoint was dropped below the water temp bit 5 on byte(10) swiched back off and byte(16) remained at 0.  I think there is no bearing here on this.
+                        // When the heat mode was changed to solar preferred and the setpoint was raised to 104F the heater kicked on and bit 5 changed from 0 to 1.  So byte(10) went from
+                        // 0100 0011 to 0100 1011 this is consistent with the heater coming on for the spa.  In this instance byte(16) also changed back to 32 which would be consistent with
+                        // an OCP where the manual heat was turned off.
+
+                        // RKS: Added check for i10d for water sensor 2.
+                        if (sys.bodies.length > 2 || sys.equipment.dual) state.temps.waterSensor2 = fnTempFromByte(msg.extractPayloadByte(15));
                         if (sys.bodies.length > 0) {
                             // const tbody: BodyTempState = state.temps.bodies.getItemById(6, true);
                             const tbody: BodyTempState = state.temps.bodies.getItemById(1, true);
@@ -482,21 +543,24 @@ export class EquipmentStateMessage {
                             tbody.heatMode = cbody.heatMode = msg.extractPayloadByte(22) & 0x03;
                             let heatStatus = sys.board.valueMaps.heatStatus.getValue('off');
                             if (tbody.isOn) {
-                                const heaterActive = (msg.extractPayloadByte(10) & 0x0C) === 12;
-                                const solarActive = (msg.extractPayloadByte(10) & 0x30) === 48;
+                                //const heaterActive = (msg.extractPayloadByte(10) & 0x0C) === 12;
+                                //const solarActive = (msg.extractPayloadByte(10) & 0x30) === 48;
+                                const heaterActive = (msg.extractPayloadByte(10) & 0x04) === 4;
+                                const solarActive = (msg.extractPayloadByte(10) & 0x10) === 10;
                                 const cooling = solarActive && tbody.temp > tbody.setPoint;
                                 if (heaterActive) heatStatus = sys.board.valueMaps.heatStatus.getValue('heater');
                                 if (cooling) heatStatus = sys.board.valueMaps.heatStatus.getValue('cooling');
                                 else if (solarActive) heatStatus = sys.board.valueMaps.heatStatus.getValue('solar');
                             }
-                            tbody.heatStatus = heatStatus; 
+                            tbody.heatStatus = heatStatus;
+                            sys.board.schedules.syncScheduleHeatSourceAndSetpoint(cbody, tbody);
                         }
                         if (sys.bodies.length > 1) {
                             // const tbody: BodyTempState = state.temps.bodies.getItemById(1, true);
                             const tbody: BodyTempState = state.temps.bodies.getItemById(2, true);
                             const cbody: Body = sys.bodies.getItemById(2);
                             if ((msg.extractPayloadByte(2) & 0x01) === 1) {
-                                tbody.temp = state.temps.waterSensor2;
+                                tbody.temp = sys.equipment.shared ? state.temps.waterSensor1 : state.temps.waterSensor2;
                                 tbody.isOn = true;
                             } else tbody.isOn = false;
                             tbody.heatMode = cbody.heatMode = (msg.extractPayloadByte(22) & 0x0c) >> 2;
@@ -505,14 +569,18 @@ export class EquipmentStateMessage {
                             tbody.circuit = cbody.circuit = 1;
                             let heatStatus = sys.board.valueMaps.heatStatus.getValue('off');
                             if (tbody.isOn) {
-                                const heaterActive = (msg.extractPayloadByte(10) & 0x0C) === 12;
-                                const solarActive = (msg.extractPayloadByte(10) & 0x30) === 48;
+                                //const heaterActive = (msg.extractPayloadByte(10) & 0x0C) === 12;
+                                //const solarActive = (msg.extractPayloadByte(10) & 0x30) === 48;
+                                const heaterActive = (msg.extractPayloadByte(10) & 0x08) === 8;
+                                const solarActive = (msg.extractPayloadByte(10) & 0x20) === 32;
+
                                 const cooling = solarActive && tbody.temp > tbody.setPoint;
                                 if (heaterActive) heatStatus = sys.board.valueMaps.heatStatus.getValue('heater');
                                 if (cooling) heatStatus = sys.board.valueMaps.heatStatus.getValue('cooling');
                                 else if (solarActive) heatStatus = sys.board.valueMaps.heatStatus.getValue('solar');
                             }
-                            tbody.heatStatus = heatStatus; 
+                            tbody.heatStatus = heatStatus;
+                            sys.board.schedules.syncScheduleHeatSourceAndSetpoint(cbody, tbody);
                         }
                     }
                     switch (sys.controllerType) {
@@ -521,7 +589,7 @@ export class EquipmentStateMessage {
                                 EquipmentStateMessage.processCircuitState(msg);
                                 // RKS: As of 1.04 the entire feature state is emitted on 204.  This message
                                 // used to contain the first 4 feature states starting in byte 8 upper 4 bits
-                                // and as of 1.047 beta this was no longer reliable.  Macro circuits onl appear
+                                // and as of 1.047 release this was no longer reliable.  Macro circuits only appear
                                 // to be available on message 30-15 and 168-15.
                                 //EquipmentStateMessage.processFeatureState(msg);
                                 sys.board.circuits.syncVirtualCircuitStates();
@@ -543,6 +611,7 @@ export class EquipmentStateMessage {
                                 state.emitControllerChange();
                                 state.emitEquipmentChanges();
                                 sys.board.heaters.syncHeaterStates();
+                                sys.board.schedules.syncScheduleStates();
                                 break;
                             }
                     }
@@ -558,10 +627,16 @@ export class EquipmentStateMessage {
                 state.time.year = msg.extractPayloadByte(5);
                 if (sys.general.options.clockSource !== 'server' || typeof sys.general.options.adjustDST === 'undefined') sys.general.options.adjustDST = msg.extractPayloadByte(7) === 0x01;
                 setTimeout(function () { sys.board.checkConfiguration(); }, 100);
+                msg.isProcessed = true;
                 break;
             case 8: {
                 // IntelliTouch only.  Heat status
                 // [165,x,15,16,8,13],[75,75,64,87,101,11,0, 0 ,62 ,0 ,0 ,0 ,0] ,[2,190]
+                // Heat Modes
+                // 1 = Heater
+                // 2 = Solar Preferred
+                // 3 = Solar Only
+
                 state.temps.waterSensor1 = msg.extractPayloadByte(0);
                 state.temps.air = msg.extractPayloadByte(2);
                 let solar: Heater = sys.heaters.getItemById(2);
@@ -582,6 +657,7 @@ export class EquipmentStateMessage {
                     if (tbody.isOn) tbody.temp = state.temps.waterSensor2 = msg.extractPayloadByte(1);
                 }
                 state.emitEquipmentChanges();
+                msg.isProcessed = true;
                 break;
             }
             case 96:
@@ -595,6 +671,7 @@ export class EquipmentStateMessage {
                 ver.lastUpdated = new Date();
                 sys.processVersionChanges(ver); */
                 sys.configVersion.lastUpdated = new Date();
+                msg.isProcessed = true;
                 break;
             }
             case 204: // IntelliCenter only.
@@ -616,6 +693,7 @@ export class EquipmentStateMessage {
                     }
                 }
                 ExternalMessage.processFeatureState(9, msg);
+                msg.isProcessed = true;
                 // state.emitControllerChange();
                 // state.emitEquipmentChanges();
                 break;
@@ -624,41 +702,42 @@ export class EquipmentStateMessage {
     // RKS: 07-06-20 I am deprecating this from processing in IntelliCenter.  This was a throwback from *Touch but
     // not all the features are represented and I am unsure if it actually processes correctly in all situations.  The
     // bytes may be set but it may also be coincidental.  This is wholly unreliable in 1.047+.  Message 204 contains the complete set.
-    private static processFeatureState(msg: Inbound) {
-        // Somewhere in this packet we need to find support for 32 bits of features.
-        // Turning on the first defined feature set by 7 to 16
-        // Turning on the second defined feature set byte 7 to 32
-        // This means that the first 4 feature circuits are located at byte 7 on the 4 most significant bits.  This leaves 28 bits
-        // unaccounted for when it comes to a total of 32 features.
+    //private static processFeatureState(msg: Inbound) {
+    //    // Somewhere in this packet we need to find support for 32 bits of features.
+    //    // Turning on the first defined feature set by 7 to 16
+    //    // Turning on the second defined feature set byte 7 to 32
+    //    // This means that the first 4 feature circuits are located at byte 7 on the 4 most significant bits.  This leaves 28 bits
+    //    // unaccounted for when it comes to a total of 32 features.
 
-        // We do know that the first 6 bytes are accounted for so byte 8, 10, or 11 are potential candidates.
-        if (sys.equipment.controllerFirmware !== '1.047') {
+    //    // We do know that the first 6 bytes are accounted for so byte 8, 10, or 11 are potential candidates.
+    //    // RKS: 09-26-20 IntelliCenter versions after 1.040 now pass the feature state in message 204.  The 2 data is no longer reliable.
+    //    if (parseFloat(sys.equipment.controllerFirmware) <= 1.04) {
 
-            // TODO: To RKS, can we combine this and processCircuitState for IntelliCenter?  
-            // Not exactly sure why we are hardcoding byte 7 here.
-            // I combined the *touch circuits and features in processTouchCircuits below.
-            let featureId = sys.board.equipmentIds.features.start;
-            for (let i = 1; i <= sys.features.length; i++) {
-                // Use a case statement here since we don't know where to go after 4.
-                switch (i) {
-                    case 1:
-                    case 2:
-                    case 3:
-                    case 4: {
-                        const byte = msg.extractPayloadByte(7);
-                        const feature = sys.features.getItemById(featureId, false, { isActive: false });
-                        if (feature.isActive !== false) {
-                            const fstate = state.features.getItemById(featureId, feature.isActive);
-                            fstate.isOn = (byte >> 4 & 1 << (i - 1)) > 0;
-                            fstate.name = feature.name;
-                        }
-                        break;
-                    }
-                }
-                featureId++;
-            }
-        }
-    }
+    //        // TODO: To RKS, can we combine this and processCircuitState for IntelliCenter?  
+    //        // Not exactly sure why we are hardcoding byte 7 here.
+    //        // I combined the *touch circuits and features in processTouchCircuits below.
+    //        let featureId = sys.board.equipmentIds.features.start;
+    //        for (let i = 1; i <= sys.features.length; i++) {
+    //            // Use a case statement here since we don't know where to go after 4.
+    //            switch (i) {
+    //                case 1:
+    //                case 2:
+    //                case 3:
+    //                case 4: {
+    //                    const byte = msg.extractPayloadByte(7);
+    //                    const feature = sys.features.getItemById(featureId, false, { isActive: false });
+    //                    if (feature.isActive !== false) {
+    //                        const fstate = state.features.getItemById(featureId, feature.isActive);
+    //                        fstate.isOn = (byte >> 4 & 1 << (i - 1)) > 0;
+    //                        fstate.name = feature.name;
+    //                    }
+    //                    break;
+    //                }
+    //            }
+    //            featureId++;
+    //        }
+    //    }
+    //}
     private static processCircuitState(msg: Inbound) {
         // The way this works is that there is one byte per 8 circuits for a total of 5 bytes or 40 circuits.  The
         // configuration already determined how many available circuits we have by querying the model of the panel
@@ -696,6 +775,7 @@ export class EquipmentStateMessage {
                 circuitId++;
             }
         }
+        msg.isProcessed = true;
     }
     private static processTouchCircuits(msg: Inbound) {
         let circuitId = 1;
@@ -733,6 +813,7 @@ export class EquipmentStateMessage {
         // state.body = body;
         //state.emitControllerChange();
         state.emitEquipmentChanges();
+        msg.isProcessed = true;
     }
     private static processIntelliBriteMode(msg: Inbound) {
         // eg RED: [165,16,16,34,96,2],[195,0],[2,12]
@@ -793,5 +874,6 @@ export class EquipmentStateMessage {
                     break;
                 }
         }
+        msg.isProcessed = true;
     }
 }

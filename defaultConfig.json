@@ -90,7 +90,7 @@
         },
         "options": {
           "host": "0.0.0.0",
-          "port":  8081
+          "port": 8081
         }
       },
       "influxDB": {
@@ -99,7 +99,7 @@
         "enabled": false,
         "fileName": "influxDB.json",
         "options": {
-          "protocol": "http",  
+          "protocol": "http",
           "host": "192.168.0.1",
           "port": 32770,
           "username": "",
@@ -122,8 +122,62 @@
           "password": "",
           "rootTopic": "@bind=(state.equipment.model).replace(' ','-').replace('/','').toLowerCase();",
           "retain": true,
-          "qos": 0
+          "qos": 0,
+          "changesOnly": true
         }
+      },
+      "mqttAlt": {
+        "name": "MQTTAlt",
+        "type": "mqtt",
+        "enabled": false,
+        "fileName": "mqttAlt.json",
+        "globals": {},
+        "options": {
+          "protocol": "mqtt://",
+          "host": "192.168.0.1",
+          "port": 1883,
+          "username": "",
+          "password": "",
+          "rootTopic": "@bind=(state.equipment.model).replace(' ','-').replace('/','').toLowerCase();Alt",
+          "retain": true,
+          "qos": 0,
+          "changesOnly": true
+        }
+      },
+
+      "rem": {
+        "name": "Relay Equipment Manager",
+        "type": "rem",
+        "enabled": false,
+        "options": {
+          "protocol": "http://",
+          "host": "raspberrypi",
+          "port": 8080,
+          "headers": {
+            "content-type": "application/json"
+          }
+        },
+        "socket": {
+          "transports": [
+            "websocket"
+          ],
+          "upgrade": false,
+          "reconnectionDelay": 2000,
+          "reconnection": true,
+          "reconnectionDelayMax": 20000
+        }
+      },
+      "rulesManager": {
+        "name": "Rules Manager",
+        "type": "http",
+        "enabled": false,
+        "fileName": "rulesManager.json",
+        "globals": {},
+        "options": {
+          "host": "localhost",
+          "port": 4200
+        },
+        "uuid": "65ee2581-e652-427e-99c6-17c6aa02a6e3"
       }
     }
   },
@@ -162,7 +216,7 @@
       "intellichem": {
         "enabled": true,
         "includeActions": [],
-        "exclueActions": [],
+        "excludeActions": [],
         "includeSource": [],
         "includeDest": [],
         "excludeSource": [],
@@ -171,7 +225,7 @@
       "intellivalve": {
         "enabled": true,
         "includeActions": [],
-        "exclueActions": [],
+        "excludeActions": [],
         "includeSource": [],
         "includeDest": [],
         "excludeSource": [],
@@ -195,7 +249,8 @@
     "app": {
       "enabled": true,
       "level": "info",
-      "captureForReplay": false
+      "captureForReplay": false,
+      "logToFile":  false
     }
   },
   "appVersion": "0.0.1"

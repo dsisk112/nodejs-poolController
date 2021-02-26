@@ -14,7 +14,7 @@ GNU Affero General Public License for more details.
 You should have received a copy of the GNU Affero General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
-import { connect, MqttClient, Client } from 'mqtt';
+import { connect, MqttClient, Client, IClientPublishOptions, CloseCallback } from 'mqtt';
 import * as http2 from "http2";
 import * as http from "http";
 import * as https from "https";
@@ -28,6 +28,7 @@ import { state as stateAlias } from "../../controller/State";
 import { webApp as webAppAlias } from '../Server';
 import { utils } from "../../controller/Constants";
 import { ServiceParameterError } from '../../controller/Errors';
+import { publicDecrypt } from 'crypto';
 
 export class MqttInterfaceBindings extends BaseInterfaceBindings {
     constructor(cfg) {
@@ -35,6 +36,7 @@ export class MqttInterfaceBindings extends BaseInterfaceBindings {
         this.subscribed = false;
     }
     private client: MqttClient;
+    private topics: string[] = [];
     public events: MqttInterfaceEvent[];
     private subscribed: boolean; // subscribed to events or not
     private sentInitialMessages = false;
@@ -56,35 +58,84 @@ export class MqttInterfaceBindings extends BaseInterfaceBindings {
         //this.client = new Client(net.Socket,opts);
         this.client = connect(url, opts);
 
-        this.client.on('connect', () => {
-            logger.info(`MQTT connected to ${url}`);
-            this.subscribe();
-        })
+        this.client.on('connect', async () => {
+            try {
+                logger.info(`MQTT connected to ${url}`);
+                await this.subscribe();
+            } catch (err) { logger.error(err); }
+        });
 
     }
+    public async stopAsync() {
+        try {
+            if (typeof this.client !== 'undefined') {
+                await this.unsubscribe();
+                await new Promise((resolve, reject) => {
+                    this.client.end(true, { reasonCode: 0, reasonString: `Shutting down MQTT Client` }, () => {
+                        logger.info(`Successfully shut down MQTT Client`);
+                        resolve();
+                    });
+                });
+            }
+        } catch (err) { logger.error(`Error stopping MQTT Client: ${err.message}`); }
+    }
+    private async unsubscribe() {
+        try {
+            while (this.topics.length > 0) {
+                let topic = this.topics.pop();
+                if (typeof topic !== 'undefined') {
+                    await new Promise((resolve, reject) => {
+                        this.client.unsubscribe(topic, (err, packet) => {
+                            if (err) reject(new Error(`Error unsubscribing from MQTT topic ${topic}`));
+                            else {
+                                logger.debug(`Unsubscribed from MQTT topic ${topic}`);
+                                resolve();
+                            }
+                        });
+                    });
+                }
+            } 
+        } catch (err) { logger.error(`Error unsubcribing to MQTT topic: ${err.message}`); }
+    }
+    private async subscribe() {
+        try {
+            if (this.topics.length > 0) await this.unsubscribe();
+            let root = this.rootTopic();
+            this.topics.push(`${root}/state/+/setState`,
+                `${root}/state/+/setstate`,
+                `${root}/state/+/toggleState`,
+                `${root}/state/+/togglestate`,
+                `${root}/state/body/setPoint`,
+                `${root}/state/body/setpoint`,
+                `${root}/state/body/heatMode`,
+                `${root}/state/body/heatmode`,
+                `${root}/state/+/setTheme`,
+                `${root}/state/+/settheme`,
+                `${root}/state/temps`,
+                `${root}/config/tempSensors`,
+                `${root}/config/chemController`,
+                `${root}/state/chemController`,
+                `${root}/config/chlorinator`,
+                `${root}/state/chlorinator`);
+            for (let i = 0; i < this.topics.length; i++) {
+                let topic = this.topics[i];
+                await new Promise((resolve, reject) => {
+                    this.client.subscribe(topic, (err, granted) => {
+                        if (!err) {
+                            logger.debug(`MQTT subscribed to ${JSON.stringify(granted)}`);
+                            resolve();
+                        }
+                        else {
+                            logger.error(`MQTT Subscribe: ${err}`);
+                            reject(err);
+                        }
+                    });
+                });
 
-    private subscribe = () => {
-        let topics = [
-        `${this.rootTopic()}/state/+/setState`,
-        `${this.rootTopic()}/state/+/setstate`,
-        `${this.rootTopic()}/state/+/toggleState`,
-        `${this.rootTopic()}/state/+/togglestate`,
-        `${this.rootTopic()}/state/body/setPoint`,
-        `${this.rootTopic()}/state/body/setpoint`,
-        `${this.rootTopic()}/state/body/heatMode`,
-        `${this.rootTopic()}/state/body/heatmode`,
-        `${this.rootTopic()}/state/+/setTheme`,
-        `${this.rootTopic()}/state/+/settheme`,
-        `${this.rootTopic()}/state/chlorinator`        
-        ];
-        topics.forEach(topic => {
-            this.client.subscribe(topic, (err, granted) => {
-                if (!err) logger.debug(`MQTT subscribed to ${JSON.stringify(granted)}`)
-                else logger.error(`MQTT Subscribe: ${err}`)
-            })
-        })
-        this.client.on('message', this.messageHandler)
-        this.subscribed = true;
+            }
+            this.client.on('message', this.messageHandler)
+            this.subscribed = true;
+        } catch (err) { logger.error(`Error subcribing to MQTT topics`); }
     }
 
     // this will take in the MQTT Formatter options and format each token that is bound
@@ -174,11 +225,14 @@ export class MqttInterfaceBindings extends BaseInterfaceBindings {
 
                     let rootTopic = this.rootTopic();
                     if (typeof opts.replacer !== 'undefined') replacer = opts.replacer;
-
                     if (typeof e.topics !== 'undefined') e.topics.forEach(t => {
-                        if (typeof t.enabled !== 'undefined' && !t.enabled) return;
-                        let topicFormatter = t.formatter || opts.formatter;
                         let topicToks = {};
+                        if (typeof t.enabled !== 'undefined' && !t.enabled) return;
+                        if (typeof t.filter !== 'undefined') {
+                            this.buildTokens(t.filter, evt, topicToks, e, data[0]);
+                            if (eval(this.replaceTokens(t.filter, topicToks)) === false) return;
+                        }
+                        let topicFormatter = t.formatter || opts.formatter;
                         let topic = '';
                         let message: any;
                         // build tokens for Topic
@@ -187,19 +241,42 @@ export class MqttInterfaceBindings extends BaseInterfaceBindings {
                         // across all topics
                         this.buildTokensWithFormatter(t.topic, evt, topicToks, e, data[0], topicFormatter);
                         topic = `${rootTopic}/${this.replaceTokens(t.topic, topicToks)}`;
+                        // Filter out any topics where there may be undefined in it.  We don't want any of this if that is the case.
+                        if (topic.endsWith('/undefined') || topic.indexOf('/undefined/') !== -1 || topic.startsWith('null/') || topic.indexOf('/null') !== -1) return;
+
+
                         this.buildTokens(t.message, evt, topicToks, e, data[0]);
                         message = this.tokensReplacer(t.message, evt, topicToks, e, data[0]);
 
-                        let retain = baseOpts.retain;
-                        if (typeof t.retain !== 'undefined') retain = t.retain;
-                        let qos = baseOpts.qos;
-                        if (typeof t.qos !== 'undefined') qos = t.qos;
-                        let publishOptions = {
-                            retain,
-                            qos
+                        let publishOptions: IClientPublishOptions = { retain: typeof baseOpts.retain !== 'undefined' ? baseOpts.retain : true, qos: typeof baseOpts.qos !== 'undefined' ? baseOpts.qos : 2 };
+                        let changesOnly = typeof baseOpts.changesOnly !== 'undefined' ? baseOpts.changesOnly : true;
+                        if (typeof e.options !== 'undefined') {
+                            if (typeof e.options.retain !== 'undefined') publishOptions.retain = e.options.retain;
+                            if (typeof e.options.qos !== 'undefined') publishOptions.retain = e.options.qos;
+                            if (typeof e.options.changesOnly !== 'undefined') changesOnly = e.options.changesOnly;
                         }
-                        logger.silly(`MQTT send:\ntopic: ${topic}\nmessage: ${message}\nopts:${JSON.stringify(publishOptions)}`)
-                        this.client.publish(topic, message, { retain: true, qos: 2 });
+                        if (typeof t.options !== 'undefined') {
+                            if (typeof t.options.retain !== 'undefined') publishOptions.retain = t.options.retain;
+                            if (typeof t.options.qos !== 'undefined') publishOptions.qos = t.options.qos;
+                            if (typeof t.options.changeOnly !== 'undefined') changesOnly = t.options.changesOnly;
+                        }
+                        if (changesOnly) {
+                            if (typeof t.lastSent === 'undefined') t.lastSent = [];
+                            let lm = t.lastSent.find(elem => elem.topic === topic);
+                            if (typeof lm === 'undefined' || lm.message !== message) {
+                                this.client.publish(topic, message, publishOptions);
+                                logger.silly(`MQTT send:\ntopic: ${topic}\nmessage: ${message}\nopts:${JSON.stringify(publishOptions)}`);
+                            }
+                            if (typeof lm === 'undefined') t.lastSent.push({ topic: topic, message: message });
+                            else lm.message = message;
+
+                        }
+                        else {
+                            logger.silly(`MQTT send:\ntopic: ${topic}\nmessage: ${message}\nopts:${JSON.stringify(publishOptions)}`);
+                            this.client.publish(topic, message, publishOptions);
+                            if (typeof t.lastSent !== 'undefined') t.lastSent = undefined;
+                        }
+
                     })
                 }
             }
@@ -209,8 +286,10 @@ export class MqttInterfaceBindings extends BaseInterfaceBindings {
         let msg = message.toString();
         if (msg[0] === '{') msg = JSON.parse(msg);
         const topics = topic.split('/');
-        if (topics[0] === this.rootTopic() && typeof msg === 'object') {
-
+        logger.debug(`MQTT: Inbound ${topic}: ${message.toString()}`);
+        if (topic.startsWith(this.rootTopic() + '/') && typeof msg === 'object') {
+            // RKS: Not sure why there is no processing of state vs config here.  Right now the topics are unique
+            // between them so it doesn't matter but it will become an issue.
             switch (topics[topics.length - 1].toLowerCase()) {
                 case 'setstate': {
                     let id = parseInt(msg.id, 10);
@@ -222,7 +301,6 @@ export class MqttInterfaceBindings extends BaseInterfaceBindings {
                         case 'circuits':
                         case 'circuit': {
                             try {
-                                logger.debug(`MQTT: Inbound CIRCUIT SETSTATE: ${JSON.stringify(msg)}`);
                                 if (msg.isOn !== 'undefined') await sys.board.circuits.setCircuitStateAsync(id, isOn);
                             }
                             catch (err) { logger.error(err); }
@@ -231,7 +309,6 @@ export class MqttInterfaceBindings extends BaseInterfaceBindings {
                         case 'features':
                         case 'feature': {
                             try {
-                                logger.debug(`MQTT: Inbound FEATURE SETSTATE: ${JSON.stringify(msg)}`);
                                 if (msg.isOn !== 'undefined') await sys.board.features.setFeatureStateAsync(id, isOn);
                             }
                             catch (err) { logger.error(err); }
@@ -240,7 +317,6 @@ export class MqttInterfaceBindings extends BaseInterfaceBindings {
                         case 'lightgroups':
                         case 'lightgroup': {
                             try {
-                                logger.debug(`MQTT: Inbound LIGHTGROUP SETSTATE: ${JSON.stringify(msg)}`);
                                 await sys.board.circuits.setLightGroupStateAsync(id, isOn);
                             }
                             catch (err) { logger.error(err); }
@@ -249,7 +325,6 @@ export class MqttInterfaceBindings extends BaseInterfaceBindings {
                         case 'circuitgroups':
                         case 'circuitgroup': {
                             try {
-                                logger.debug(`MQTT: Inbound CIRCUITGROUP SETSTATE: ${JSON.stringify(msg)}`);
                                 await sys.board.circuits.setCircuitGroupStateAsync(id, isOn);
                             }
                             catch (err) { logger.error(err); }
@@ -269,88 +344,94 @@ export class MqttInterfaceBindings extends BaseInterfaceBindings {
                         switch (topics[topics.length - 2].toLowerCase()) {
                             case 'circuits':
                             case 'circuit':
-                                {
-                                    try {
-                                        logger.debug(`MQTT: Inbound CIRCUIT TOGGLESTATE: ${JSON.stringify(msg)}`);
-                                        await sys.board.circuits.toggleCircuitStateAsync(id);
-                                    }
-                                    catch (err) { logger.error(err); }
-                                    break;
+                                try {
+                                    await sys.board.circuits.toggleCircuitStateAsync(id);
                                 }
+                                catch (err) { logger.error(err); }
+                                break;
                             case 'features':
                             case 'feature':
-                                {
-                                    try {
-                                        logger.debug(`MQTT: Inbound FEATURE TOGGLESTATE: ${JSON.stringify(msg)}`);
-                                        await sys.board.features.toggleFeatureStateAsync(id);
-                                    }
-                                    catch (err) { logger.error(err); }
-                                    break;
+                                try {
+                                    await sys.board.features.toggleFeatureStateAsync(id);
                                 }
+                                catch (err) { logger.error(err); }
+                                break;
                             default:
                                 logger.warn(`MQTT: Inbound topic ${topics[topics.length - 1]} not matched to event ${topics[topics.length - 2].toLowerCase()}. Message ${msg} `)
                         }
-
+                        break;
                     }
                 case 'setpoint':
-                    {
-                        try {
-                            let body = sys.bodies.findByObject(msg);
-                            if (topics[topics.length - 2].toLowerCase() === 'body') {
-                                if (typeof body === 'undefined') {
-                                    logger.error(new ServiceParameterError(`Cannot set body setPoint.  You must supply a valid id, circuit, name, or type for the body`, 'body', 'id', msg.id));
-                                    return;
-                                }
-                                let tbody = await sys.board.bodies.setHeatSetpointAsync(body, parseInt(msg.setPoint, 10));
-                            }
-                        }
-                        catch (err) { logger.error(err); }
-
-                        break;
-                    }
-                case 'heatmode':
-                    {
-                        try {
-                            if (topics[topics.length - 2].toLowerCase() !== 'body') return;
-                            // Map the mode that was passed in.  This should accept the text based name or the ordinal id value.
-                            let mode = parseInt(msg.mode, 10);
-                            let val;
-                            if (isNaN(mode)) mode = parseInt(msg.heatMode, 10);
-                            if (!isNaN(mode)) val = sys.board.valueMaps.heatModes.transform(mode);
-                            else val = sys.board.valueMaps.heatModes.transformByName(msg.mode || msg.heatMode);
-                            if (typeof val.val === 'undefined') {
-                                logger.error(new ServiceParameterError(`Invalid value for heatMode: ${msg.mode}`, 'body', 'heatMode', mode));
-                                return;
-                            }
-                            mode = val.val;
-                            let body = sys.bodies.findByObject(msg);
+                    try {
+                        let body = sys.bodies.findByObject(msg);
+                        if (topics[topics.length - 2].toLowerCase() === 'body') {
                             if (typeof body === 'undefined') {
-                                logger.error(new ServiceParameterError(`Cannot set body heatMode.  You must supply a valid id, circuit, name, or type for the body`, 'body', 'id', msg.id));
+                                logger.error(new ServiceParameterError(`Cannot set body setPoint.  You must supply a valid id, circuit, name, or type for the body`, 'body', 'id', msg.id));
                                 return;
                             }
-                            let tbody = await sys.board.bodies.setHeatModeAsync(body, mode);
+                            let tbody = await sys.board.bodies.setHeatSetpointAsync(body, parseInt(msg.setPoint, 10));
                         }
-                        catch (err) { logger.error(err); }
-                        break;
                     }
+                    catch (err) { logger.error(err); }
+                    break;
+                case 'heatmode':
+                    try {
+                        if (topics[topics.length - 2].toLowerCase() !== 'body') return;
+                        // Map the mode that was passed in.  This should accept the text based name or the ordinal id value.
+                        let mode = parseInt(msg.mode, 10);
+                        let val;
+                        if (isNaN(mode)) mode = parseInt(msg.heatMode, 10);
+                        if (!isNaN(mode)) val = sys.board.valueMaps.heatModes.transform(mode);
+                        else val = sys.board.valueMaps.heatModes.transformByName(msg.mode || msg.heatMode);
+                        if (typeof val.val === 'undefined') {
+                            logger.error(new ServiceParameterError(`Invalid value for heatMode: ${msg.mode}`, 'body', 'heatMode', mode));
+                            return;
+                        }
+                        mode = val.val;
+                        let body = sys.bodies.findByObject(msg);
+                        if (typeof body === 'undefined') {
+                            logger.error(new ServiceParameterError(`Cannot set body heatMode.  You must supply a valid id, circuit, name, or type for the body`, 'body', 'id', msg.id));
+                            return;
+                        }
+                        let tbody = await sys.board.bodies.setHeatModeAsync(body, mode);
+                    }
+                    catch (err) { logger.error(err); }
+                    break;
                 case 'chlorinator':
-                    {
-                        try {
-                            let schlor = await sys.board.chlorinator.setChlorAsync(msg);
-                        }
-                        catch (err) { logger.error(err); }
-                        break;
+                    try {
+                        let schlor = await sys.board.chlorinator.setChlorAsync(msg);
                     }
+                    catch (err) { logger.error(err); }
+                    break;
+                case 'chemcontroller':
+                    try {
+                        await sys.board.chemControllers.setChemControllerAsync(msg);
+                    }
+                    catch (err) { logger.error(err); }
+                    break;
                 case 'settheme':
-                    {
-                        try {
-                            let theme = await state.circuits.setLightThemeAsync(parseInt(msg.id, 10), parseInt(msg.theme, 10));   
-                        }
-                        catch (err) {logger.error(err); }
-                        break;
+                    try {
+                        let theme = await state.circuits.setLightThemeAsync(parseInt(msg.id, 10), parseInt(msg.theme, 10));
                     }
+                    catch (err) { logger.error(err); }
+                    break;
+                case 'temp':
+                case 'temps':
+                    try {
+                        await sys.board.system.setTempsAsync(msg);
+                    }
+                    catch (err) { logger.error(err); }
+                    break;
+                case 'tempsensor':
+                case 'tempsensors':
+                    try {
+                        await sys.board.system.setTempSensorsAsync(msg);
+                    }
+                    catch (err) { logger.error(err); }
+                    break;
                 default:
                     logger.silly(`MQTT: Inbound MQTT topic not matched: ${topic}: ${message.toString()}`)
+                    break;
             }
         }
     }
@@ -368,4 +449,11 @@ export interface IMQTT {
     qos: string;
     retain: boolean;
     enabled?: boolean;
+    filter?: string;
+    lastSent: MQTTMessage[];
+    options: any;
+}
+class MQTTMessage {
+    topic: string;
+    message: string;
 }

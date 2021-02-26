@@ -17,9 +17,11 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 import * as path from "path";
 import * as fs from "fs";
 import express = require('express');
+import { utils } from "../controller/Constants";
 import { config } from "../config/Config";
 import { logger } from "../logger/Logger";
 import socketio = require("socket.io");
+const sockClient = require('socket.io-client');
 import { ConfigRoute } from "./services/config/Config";
 import { StateRoute } from "./services/state/State";
 import { StateSocket } from "./services/state/StateSocket";
@@ -55,21 +57,25 @@ export class WebServer {
         let srv;
         for (let s in cfg.servers) {
             let c = cfg.servers[s];
+            if (typeof c.uuid === 'undefined') {
+                c.uuid = utils.uuid();
+                config.setSection(`web.servers.${s}`, c);
+            }
             switch (s) {
                 case 'http':
-                    srv = new HttpServer();
+                    srv = new HttpServer(s, s);
                     break;
                 case 'http2':
-                    srv = new Http2Server();
+                    srv = new Http2Server(s, s);
                     break;
                 case 'https':
-                    srv = new HttpsServer();
+                    srv = new HttpsServer(s, s);
                     break;
                 case 'mdns':
-                    srv = new MdnsServer();
+                    srv = new MdnsServer(s, s);
                     break;
                 case 'ssdp':
-                    srv = new SsdpServer();
+                    srv = new SsdpServer(s, s);
                     break;
             }
             if (typeof srv !== 'undefined') {
@@ -81,22 +87,31 @@ export class WebServer {
         for (let s in cfg.interfaces) {
             let int;
             let c = cfg.interfaces[s];
+            if (typeof c.uuid === 'undefined') {
+                c.uuid = utils.uuid();
+                config.setSection(`web.interfaces.${s}`, c);
+            }
             if (!c.enabled) continue;
             let type = c.type || 'http';
             logger.info(`Init ${type} interface: ${c.name}`);
             switch (type) {
                 case 'http':
-                    int = new HttpInterfaceServer();
+                    int = new HttpInterfaceServer(c.name, type);
                     int.init(c);
                     this._servers.push(int);
                     break;
                 case 'influx':
-                    int = new InfluxInterfaceServer();
+                    int = new InfluxInterfaceServer(c.name, type);
                     int.init(c);
                     this._servers.push(int);
                     break;
                 case 'mqtt':
-                    int = new MqttInterfaceServer();
+                    int = new MqttInterfaceServer(c.name, type);
+                    int.init(c);
+                    this._servers.push(int);
+                    break;
+                case 'rem':
+                    int = new REMInterfaceServer(c.name, type);
                     int.init(c);
                     this._servers.push(int);
                     break;
@@ -115,10 +130,20 @@ export class WebServer {
     }
     public get mdnsServer(): MdnsServer { return this._servers.find(elem => elem instanceof MdnsServer) as MdnsServer; }
     public deviceXML() { } // override in SSDP
-    public stop() {
-        for (let s in this._servers) {
-            if (typeof this._servers[s].stop() === 'function') this._servers[s].stop();
-        }
+    public async stopAsync() {
+        try {
+            // We want to stop all the servers in reverse order so let's pop them out.
+            for (let s in this._servers) {
+                try {
+                    let serv = this._servers[s];
+                    if (typeof serv.stopAsync === 'function') {
+                        await serv.stopAsync();
+                    }
+                    this._servers[s] = undefined;
+                } catch (err) { console.log(`Error stopping server ${s}: ${err.message}`); }
+            }
+        } catch (err) {`Error stopping servers`}
+
     }
     private getInterface() {
         const networkInterfaces = os.networkInterfaces();
@@ -143,13 +168,21 @@ export class WebServer {
     public mac() {
         return typeof this.getInterface() === 'undefined' ? '00:00:00:00' : this.getInterface().mac;
     }
+    public findServer(name: string): ProtoServer { return this._servers.find(elem => elem.name === name); }
+    public findServersByType(type: string) { return this._servers.filter(elem => elem.type === type); }
+    public findServerByGuid(uuid: string) { return this._servers.find(elem => elem.uuid === uuid); }
 }
 class ProtoServer {
+    constructor(name: string, type: string) { this.name = name; this.type = type; }
+    public name: string;
+    public type: string;
+    public uuid: string;
     // base class for all servers.
     public isRunning: boolean = false;
+    public get isConnected() { return this.isRunning; }
     public emitToClients(evt: string, ...data: any) { }
     public emitToChannel(channel: string, evt: string, ...data: any) { }
-    public stop() { }
+    public async stopAsync() { }
     protected _dev: boolean = process.env.NODE_ENV !== 'production';
     // todo: how do we know if the client is using IPv4/IPv6?
 }
@@ -157,6 +190,7 @@ export class Http2Server extends ProtoServer {
     public server: http2.Http2Server;
     public app: Express.Application;
     public init(cfg) {
+        this.uuid = cfg.uuid;
         if (cfg.enabled) {
             this.app = express();
             // TODO: create a key and cert at some time but for now don't fart with it.
@@ -170,7 +204,7 @@ export class HttpServer extends ProtoServer {
     public sockServer: socketio.Server;
     //public parcel: parcelBundler;
     private _sockets: socketio.Socket[] = [];
-    private _pendingMsg: Inbound;
+    //private _pendingMsg: Inbound;
     public emitToClients(evt: string, ...data: any) {
         if (this.isRunning) {
             // console.log(JSON.stringify({evt:evt, msg: 'Emitting...', data: data },null,2));
@@ -181,6 +215,7 @@ export class HttpServer extends ProtoServer {
         //console.log(`Emitting to channel ${channel} - ${evt}`)
         if (this.isRunning) this.sockServer.to(channel).emit(evt, ...data);
     }
+    public get isConnected() { return typeof this.sockServer !== 'undefined' && this._sockets.length > 0; }
     protected initSockets() {
         this.sockServer = socketio(this.server, { cookie: false });
 
@@ -202,6 +237,7 @@ export class HttpServer extends ProtoServer {
         });
         this.app.use('/socket.io-client', express.static(path.join(process.cwd(), '/node_modules/socket.io-client/dist/'), { maxAge: '60d' }));
     }
+
     private socketHandler(sock: socketio.Socket) {
         let self = this;
         this._sockets.push(sock);
@@ -271,6 +307,7 @@ export class HttpServer extends ProtoServer {
         ConfigSocket.initSockets(sock);
     }
     public init(cfg) {
+        this.uuid = cfg.uuid;
         if (cfg.enabled) {
             this.app = express();
 
@@ -280,7 +317,8 @@ export class HttpServer extends ProtoServer {
                 var cfgHttps = config.getSection('web').server.https;
                 this.app.get('*', (res: express.Response, req: express.Request) => {
                     let host = res.get('host');
-                    host = host.replace(/:\d+$/, ':' + cfgHttps.port);
+                    // Only append a port if there is one declared.  This will be the case for urls that have have an implicit port.
+                    host = host.replace(/:\d+$/, typeof cfgHttps.port !== 'undefined' ? ':' + cfgHttps.port : '');
                     return res.redirect('https://' + host + req.url);
                 });
             }
@@ -342,6 +380,7 @@ export class HttpsServer extends HttpServer {
     
     public init(cfg) {
         // const auth = require('http-auth');
+        this.uuid = cfg.uuid;
         if (!cfg.enabled) return;
         try {
             this.app = express();
@@ -427,6 +466,7 @@ export class SsdpServer extends ProtoServer {
     // Simple service discovery protocol
     public server: any; //node-ssdp;
     public init(cfg) {
+        this.uuid = cfg.uuid;
         if (cfg.enabled) {
             let self = this;
 
@@ -457,7 +497,7 @@ export class SsdpServer extends ProtoServer {
             });
         }
     }
-    public deviceXML() {
+    public static deviceXML() {
         let ver = sys.appVersion;
         let XML = `<?xml version="1.0"?>
                         <root xmlns="urn:schemas-upnp-org:PoolController-1-0">
@@ -479,8 +519,11 @@ export class SsdpServer extends ProtoServer {
                         </root>`;
         return XML;
     }
-    public stop() {
-        this.server.stop();
+    public async stopAsync() {
+        try {
+            this.server.stop();
+            logger.info(`Stopped SSDP server: ${this.name}`);
+        } catch (err) { logger.error(`Error stopping SSDP server ${err.message}`); }
     }
 }
 export class MdnsServer extends ProtoServer {
@@ -489,6 +532,7 @@ export class MdnsServer extends ProtoServer {
     public mdnsEmitter = new EventEmitter();
     private queries = [];
     public init(cfg) {
+        this.uuid = cfg.uuid;
         if (cfg.enabled) {
             logger.info('Starting up MDNS server');
             this.server = multicastdns({ loopback: true });
@@ -552,6 +596,17 @@ export class MdnsServer extends ProtoServer {
         }
         this.server.query({ questions: [query] });
     }
+    public async stopAsync() {
+        try {
+            await new Promise((resolve, reject) => {
+                this.server.destroy((err) => {
+                    if (err) reject(err);
+                    else resolve();
+                });
+            });
+            logger.info(`Shut down MDNS Server ${this.name}`);
+        } catch (err) { logger.error(`Error shutting down MDNS Server ${this.name}: ${err.message}`); }
+    }
 }
 export class HttpInterfaceServer extends ProtoServer {
     public bindingsPath: string;
@@ -559,6 +614,7 @@ export class HttpInterfaceServer extends ProtoServer {
     private _fileTime: Date = new Date(0);
     private _isLoading: boolean = false;
     public init(cfg) {
+        this.uuid = cfg.uuid;
         if (cfg.enabled) {
             if (cfg.fileName && this.initBindings(cfg)) this.isRunning = true;
         }
@@ -625,6 +681,12 @@ export class HttpInterfaceServer extends ProtoServer {
             this.bindings.bindEvent(evt, ...data);
         }
     }
+    public async stopAsync() {
+        try {
+            logger.info(`${this.name} Interface Server Shut down`);
+        }
+        catch (err) { }
+    }
 }
 
 export class InfluxInterfaceServer extends ProtoServer {
@@ -633,6 +695,7 @@ export class InfluxInterfaceServer extends ProtoServer {
     private _fileTime: Date = new Date(0);
     private _isLoading: boolean = false;
     public init(cfg) {
+        this.uuid = cfg.uuid;
         if (cfg.enabled) {
             if (cfg.fileName && this.initBindings(cfg)) this.isRunning = true;
         }
@@ -692,7 +755,9 @@ export class MqttInterfaceServer extends ProtoServer {
     public bindings: HttpInterfaceBindings;
     private _fileTime: Date = new Date(0);
     private _isLoading: boolean = false;
+    public get isConnected() { return this.isRunning && this.bindings.events.length > 0; }
     public init(cfg) {
+        this.uuid = cfg.uuid;
         if (cfg.enabled) {
             if (cfg.fileName && this.initBindings(cfg)) this.isRunning = true;
         }
@@ -746,6 +811,166 @@ export class MqttInterfaceServer extends ProtoServer {
             this.bindings.bindEvent(evt, ...data);
         }
     }
+    public async stopAsync() {
+        try {
+            if (typeof this.bindings !== 'undefined') await this.bindings.stopAsync();
+        } catch (err) { logger.error(`Error shutting down MQTT Server ${this.name}: ${err.message}`); }
+    }
 }
+export class InterfaceServerResponse {
+    constructor(statusCode?: number, statusMessage?: string) {
+        if (typeof statusCode !== 'undefined') this.status.code = statusCode;
+        if (typeof statusMessage !== 'undefined') this.status.message = statusMessage;
+    }
+    status: { code: number, message: string } = { code: -1, message: '' };
+    error: Error;
+    data: string;
+    obj: any;
+}
+export class REMInterfaceServer extends ProtoServer {
+    public init(cfg) {
+        this.cfg = cfg;
+        this.uuid = cfg.uuid;
+        if (cfg.enabled) {
+            this.initSockets();
+        }
+    }
+    public async stopAsync() {
+        try {
+            if (typeof this.agent !== 'undefined') this.agent.destroy();
+            if (typeof this.sockClient !== 'undefined') this.sockClient.destroy();
+            logger.info(`Stopped REM Interface Server ${this.name}`);
+        } catch (err) { logger.error(`Error closing REM Server ${this.name}: ${err.message}`); }
+    }
+    public cfg;
+    public sockClient;
+    protected agent: http.Agent = new http.Agent({ keepAlive: true });
+    public get isConnected() { return this.sockClient !== 'undefined' && this.sockClient.connected; };
+    private _sockets: socketio.Socket[] = [];
+    private async sendClientRequest(method: string, url: string, data?: any, timeout:number = 10000): Promise<InterfaceServerResponse> {
+        try {
+           
+            let ret = new InterfaceServerResponse();
+            let opts = extend(true, { headers: {} }, this.cfg.options);
+            if ((typeof opts.hostname === 'undefined' || !opts.hostname) && (typeof opts.host === 'undefined' || !opts.host || opts.host === '*')) {
+                ret.error = new Error(`Interface: ${this.cfg.name} has not resolved to a valid host.`)
+                logger.warn(ret.error);
+                return ret;
+            }
+            let sbody = typeof data === 'undefined' ? '' : typeof data === 'string' ? data : typeof data === 'object' ? JSON.stringify(data) : data.toString();
+            if (typeof sbody !== 'undefined') {
+                if (sbody.charAt(0) === '"' && sbody.charAt(sbody.length - 1) === '"') sbody = sbody.substr(1, sbody.length - 2);
+                opts.headers["CONTENT-LENGTH"] = Buffer.byteLength(sbody || '');
+            }
+            opts.path = url;
+            opts.method = method || 'GET';
+            ret.data = '';
+            opts.agent = this.agent;
+            logger.verbose(`REM server request initiated. ${opts.method} ${opts.path} ${sbody}`);
+            await new Promise((resolve, reject) => {
+                let req: http.ClientRequest;
+                if (opts.port === 443 || (opts.protocol || '').startsWith('https')) {
+                    opts.protocol = 'https:';
+                    req = https.request(opts, (response: http.IncomingMessage) => {
+                        ret.status.code = response.statusCode;
+                        ret.status.message = response.statusMessage;
+                        response.on('error', (err) => { ret.error = err; resolve(); });
+                        response.on('data', (data) => { ret.data += data; });
+                        response.on('end', () => { resolve(); });
+                    });
+                }
+                else {
+                    opts.protocol = undefined;
+                    req = http.request(opts, (response: http.IncomingMessage) => {
+                        ret.status.code = response.statusCode;
+                        ret.status.message = response.statusMessage;
+                        response.on('error', (err) => { ret.error = err; resolve(); });
+                        response.on('data', (data) => { ret.data += data; });
+                        response.on('end', () => { resolve(); });
+                    });
+                }
+                req.setTimeout(timeout, () => { reject(new Error('Request timeout')); });
+                req.on('error', (err, req, res) => { logger.error(`Error sending Request: ${opts.method} ${url} ${err.message}`); ret.error = err; });
+                req.on('abort', () => { logger.warn('Request Aborted'); reject(new Error('Request Aborted.')); });
+                req.end(sbody);
+                logger.verbose(`REM server request returned. ${opts.method} ${opts.path} ${sbody}`);
+            }).catch((err) => { logger.error(`Error Sending REM Request: ${opts.method} ${url} ${err.message}`); ret.error = err; });
+            if (ret.status.code > 200) {
+                // We have an http error so let's parse it up.
+                try {
+                    ret.error = JSON.parse(ret.data);
+                } catch (err) { ret.error = new Error(`Unidentified ${ret.status.code} Error: ${ret.status.message}`) }
+                ret.data = '';
+            }
+            else if (ret.status.code === 200 && this.isJSONString(ret.data)) {
+                try { ret.obj = JSON.parse(ret.data); }
+                catch (err) {}
+            }
+            return ret;
+        }
+        catch (err) { return Promise.reject(`Http ${method} Error ${url}:${err.message}`); }
+    }
+    private initSockets() {
+        try {
+            let self = this;
+            let url = `${this.cfg.options.protocol || 'http://'}${this.cfg.options.host}${typeof this.cfg.options.port !== 'undefined' ? ':' + this.cfg.options.port : ''}`;
+            logger.info(`Opening ${this.cfg.name} socket on ${url}`);
+            //console.log(this.cfg);
+            this.sockClient = sockClient(url, extend(true,
+                { reconnectionDelay: 2000, reconnection: true, reconnectionDelayMax: 20000, transports: ['websocket'], upgrade: false }, this.cfg.socket));
+            if (typeof this.sockClient === 'undefined') return Promise.reject(new Error('Could not Initialize REM Server.  Invalid configuration.'));
+            //this.sockClient = io.connect(url, { reconnectionDelay: 2000, reconnection: true, reconnectionDelayMax: 20000 });
+            //console.log(this.sockClient);
+            //console.log(typeof this.sockClient.on);
+            this.sockClient.on('connect_error', (err) => { logger.error(`${this.cfg.name} socket connection error: ${err}`); });
+            this.sockClient.on('connect_timeout', () => { logger.error(`${this.cfg.name} socket connection timeout`); });
+            this.sockClient.on('reconnect', (attempts) => { logger.info(`${this.cfg.name} socket reconnected after ${attempts}`); });
+            this.sockClient.on('reconnect_attempt', () => { logger.warn(`${this.cfg.name} socket attempting to reconnect`); });
+            this.sockClient.on('reconnecting', (attempts) => { logger.warn(`${this.cfg.name} socket attempting to reconnect: ${attempts}`); });
+            this.sockClient.on('reconnect_failed', (err) => { logger.warn(`${this.cfg.name} socket failed to reconnect: ${err}`); });
+            this.sockClient.on('close', () => { logger.info(`${this.cfg.name} socket closed`); });
+            this.sockClient.on('connect', () => {
+                logger.info(`${this.cfg.name} socket connected`);
+                this.sockClient.on('i2cDataValues', function (data) {
+                    //logger.info(`REM Socket i2cDataValues ${JSON.stringify(data)}`);
 
+                });
+            });
+            this.isRunning = true;
+        }
+        catch (err) { logger.error(err); }
+    }
+    private isJSONString(s: string): boolean {
+        if (typeof s !== 'string') return false;
+        if (typeof s.startsWith('{') || typeof s.startsWith('[')) return true;
+        return false;
+    }
+    public async getApiService(url: string, data?: any, timeout:number = 3600): Promise<InterfaceServerResponse> {
+        // Calls a rest service on the REM to set the state of a connected device.
+        try { let ret = await this.sendClientRequest('GET', url, data, timeout); return ret; }
+        catch (err) {  return Promise.reject(err); }
+    }
+    public async putApiService(url: string, data?: any, timeout: number = 3600): Promise<InterfaceServerResponse> {
+        // Calls a rest service on the REM to set the state of a connected device.
+        try { let ret = await this.sendClientRequest('PUT', url, data, timeout); return ret;}
+        catch (err) { return Promise.reject(err); }
+    }
+    public async searchApiService(url: string, data?: any, timeout: number = 3600): Promise<InterfaceServerResponse> {
+        // Calls a rest service on the REM to set the state of a connected device.
+        try { let ret = await this.sendClientRequest('SEARCH', url, data, timeout); return ret;}
+        catch (err) { return Promise.reject(err); }
+    }
+    public async deleteApiService(url: string, data?: any, timeout: number = 3600): Promise<InterfaceServerResponse> {
+        // Calls a rest service on the REM to set the state of a connected device.
+        try { let ret = await this.sendClientRequest('DELETE', url, data, timeout); return ret;}
+        catch (err) { return Promise.reject(err); }
+    }
+    public async getDevices() {
+        try {
+            let response = await this.sendClientRequest('GET', '/devices/all', undefined, 10000);
+            return (response.status.code === 200) ? JSON.parse(response.data) : [];
+        }
+        catch (err) { logger.error(err); }
+    }
+}
 export const webApp = new WebServer();

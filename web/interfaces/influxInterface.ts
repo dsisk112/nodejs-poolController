@@ -16,17 +16,15 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
 import extend = require("extend");
-import { ClientOptions, InfluxDB, Point, WritePrecision } from '@influxdata/influxdb-client';
+import { ClientOptions, InfluxDB, Point, WritePrecision, WriteApi } from '@influxdata/influxdb-client';
 import { utils } from '../../controller/Constants';
 import { logger } from "../../logger/Logger";
 import { BaseInterfaceBindings, InterfaceContext, InterfaceEvent } from "./baseInterface";
-
-
 export class InfluxInterfaceBindings extends BaseInterfaceBindings {
     constructor(cfg) {
         super(cfg);
     }
-    private writeApi;
+    private writeApi: WriteApi;
     public context: InterfaceContext;
     public cfg;
     public events: InfluxInterfaceEvent[];
@@ -46,27 +44,22 @@ export class InfluxInterfaceBindings extends BaseInterfaceBindings {
         url = `${url}://${baseOpts.host}:${baseOpts.port}`;
         // TODO: add username/password
         const bucket = `${baseOpts.database}/${baseOpts.retentionPolicy}`;
-        const clientOptions:ClientOptions = {
+        const clientOptions: ClientOptions = {
             url,
             token: `${baseOpts.username}:${baseOpts.password}`,
         }
         const influxDB = new InfluxDB(clientOptions);
         this.writeApi = influxDB.getWriteApi('', bucket, 'ms' as WritePrecision);
-
+        
+       
         // set global tags from context
         let baseTags = {}
-        baseOpts.tags.forEach(tag=> {
+        baseOpts.tags.forEach(tag => {
             let toks = {};
             let sname = this.tokensReplacer(tag.name, undefined, toks, undefined, {})
-            /* let sname = tag.name;
-            this.buildTokens(sname, undefined, toks, undefined, {});
-            sname = this.replaceTokens(sname, toks); */
-            let svalue = this.tokensReplacer(tag.value, undefined, toks, {vars:{}} as any, {});
-            /* let svalue = tag.value;
-            this.buildTokens(svalue, undefined, toks, {vars:{}} as any, {});
-            svalue = this.replaceTokens(svalue, toks); */
+            let svalue = this.tokensReplacer(tag.value, undefined, toks, { vars: {} } as any, {});
             if (typeof sname !== 'undefined' && typeof svalue !== 'undefined' && !sname.includes('@bind') && !svalue.includes('@bind'))
-            baseTags[sname] = svalue;
+                baseTags[sname] = svalue;
         })
         this.writeApi.useDefaultTags(baseTags);
     }
@@ -81,7 +74,18 @@ export class InfluxInterfaceBindings extends BaseInterfaceBindings {
                 for (let i = 0; i < evts.length; i++) {
                     let e = evts[i];
                     if (typeof e.enabled !== 'undefined' && !e.enabled) continue;
-                    e.points.forEach(_point => {
+                    // Figure out whether we need to check the filter.
+                    if (typeof e.filter !== 'undefined') {
+                        this.buildTokens(e.filter, evt, toks, e, data[0]);
+                        if (eval(this.replaceTokens(e.filter, toks)) === false) continue;
+                    }
+                    for (let j = 0; j < e.points.length; j++){
+                        let _point = e.points[j];
+                        // Figure out whether we need to check the filter for each point.
+                        if (typeof _point.filter !== 'undefined') {
+                            this.buildTokens(_point.filter, evt, toks, e, data[0]);
+                            if (eval(this.replaceTokens(_point.filter, toks)) === false) continue;
+                        }
                         // iterate through points array
                         let point = new Point(_point.measurement)
                         let point2 = new Point(_point.measurement);
@@ -92,52 +96,53 @@ export class InfluxInterfaceBindings extends BaseInterfaceBindings {
                             let svalue = _tag.value;
                             this.buildTokens(svalue, evt, toks, e, data[0]);
                             svalue = this.replaceTokens(svalue, toks);
-                            if (typeof sname !== 'undefined' && typeof svalue !== 'undefined' && !sname.includes('@bind') && !svalue.includes('@bind')  && svalue !== null){
+                            if (typeof sname !== 'undefined' && typeof svalue !== 'undefined' && !sname.includes('@bind') && !svalue.includes('@bind') && svalue !== null) {
                                 point.tag(sname, svalue);
                                 if (typeof _point.storePrevState !== 'undefined' && _point.storePrevState) point2.tag(sname, svalue);
                             }
                             else {
-                                console.log(`failed on ${_tag.name}/${_tag.value}`);
+                                console.log(`failed on ${evt}:${_tag.name}/${_tag.value} ${JSON.stringify(data[0])}`);
                             }
                         })
                         _point.fields.forEach(_field => {
                             let sname = _field.name;
                             this.buildTokens(sname, evt, toks, e, data[0]);
+                            //console.log(toks);
                             sname = this.replaceTokens(sname, toks);
                             let svalue = _field.value;
                             this.buildTokens(svalue, evt, toks, e, data[0]);
                             svalue = this.replaceTokens(svalue, toks);
                             if (typeof sname !== 'undefined' && typeof svalue !== 'undefined' && !sname.includes('@bind') && !svalue.includes('@bind') && svalue !== null)
-                            switch (_field.type) {
-                                case 'int':
-                                case 'integer':
-                                    let int  = parseInt(svalue, 10);
-                                    if (!isNaN(int)) point.intField(sname, int);
-                                    // if (!isNaN(int) && typeof _point.storePrevState !== 'undefined' && _point.storePrevState) point2.intField(sname, int);
-                                    break;
-                                case 'string':
-                                    point.stringField(sname, svalue);
-                                    // if (typeof _point.storePrevState !== 'undefined' && _point.storePrevState) point2.stringField(sname, svalue);
-                                    break;
-                                case 'boolean':
-                                    point.booleanField(sname, utils.makeBool(svalue));
-                                    if (typeof _point.storePrevState !== 'undefined' && _point.storePrevState) point2.booleanField(sname, !utils.makeBool(svalue));
-                                    break;
-                                case 'float':
-                                    let float = parseFloat(svalue);
-                                    if (!isNaN(float)) point.floatField(sname, float);
-                                    // if (!isNaN(float) && typeof _point.storePrevState !== 'undefined' && _point.storePrevState) point2.intField(sname, int);
-                                    break;
-                            }
+                                switch (_field.type) {
+                                    case 'int':
+                                    case 'integer':
+                                        let int = parseInt(svalue, 10);
+                                        if (!isNaN(int)) point.intField(sname, int);
+                                        // if (!isNaN(int) && typeof _point.storePrevState !== 'undefined' && _point.storePrevState) point2.intField(sname, int);
+                                        break;
+                                    case 'string':
+                                        point.stringField(sname, svalue);
+                                        // if (typeof _point.storePrevState !== 'undefined' && _point.storePrevState) point2.stringField(sname, svalue);
+                                        break;
+                                    case 'boolean':
+                                        point.booleanField(sname, utils.makeBool(svalue));
+                                        if (typeof _point.storePrevState !== 'undefined' && _point.storePrevState) point2.booleanField(sname, !utils.makeBool(svalue));
+                                        break;
+                                    case 'float':
+                                        let float = parseFloat(svalue);
+                                        if (!isNaN(float)) point.floatField(sname, float);
+                                        // if (!isNaN(float) && typeof _point.storePrevState !== 'undefined' && _point.storePrevState) point2.intField(sname, int);
+                                        break;
+                                }
                             else {
                                 console.log(`failed on ${_field.name}/${_field.value}`);
-                                
+
                             }
                         })
                         point.timestamp(new Date());
                         try {
 
-                            if (typeof _point.storePrevState !== 'undefined' && _point.storePrevState){
+                            if (typeof _point.storePrevState !== 'undefined' && _point.storePrevState) {
                                 // copy the point and subtract a second and keep inverse value
                                 let ts = new Date();
                                 let sec = ts.getSeconds() - 1;
@@ -145,18 +150,18 @@ export class InfluxInterfaceBindings extends BaseInterfaceBindings {
                                 point2.timestamp(ts);
                                 this.writeApi.writePoint(point2);
                             }
-                            if (typeof point.toLineProtocol() !== 'undefined'){
+                            if (typeof point.toLineProtocol() !== 'undefined') {
                                 this.writeApi.writePoint(point);
-                                logger.info(`INFLUX: ${point.toLineProtocol()}`)
+                                //logger.info(`INFLUX: ${point.toLineProtocol()}`)
                             }
                             else {
                                 logger.silly(`Skipping INFLUX write because some data is missing with ${e.name} event on measurement ${_point.measurement}.`)
                             }
                         }
-                        catch (err){
+                        catch (err) {
                             logger.error(`Error writing to Influx: ${err.message}`)
                         }
-                    })
+                    }
                 }
             }
         }
@@ -175,6 +180,7 @@ export interface IPoint {
     tags: ITag[];
     fields: IFields[];
     storePrevState?: boolean;
+    filter?: any;
 }
 export interface ITag {
     name: string;

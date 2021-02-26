@@ -23,6 +23,7 @@ import * as net from 'net';
 import { setTimeout, setInterval } from 'timers';
 import { Message, Outbound, Inbound, Response } from './messages/Messages';
 import { OutboundMessageError } from '../Errors';
+const extend = require("extend");
 export class Connection {
     constructor() {
         this.emitter = new EventEmitter();
@@ -36,32 +37,70 @@ export class Connection {
     private connTimer: NodeJS.Timeout;
     protected resetConnTimer(...args) {
         if (conn.connTimer !== null) clearTimeout(conn.connTimer);
-        if (!conn._cfg.mockPort && conn._cfg.inactivityRetry > 0) conn.connTimer = setTimeout(() => conn.open(...args), conn._cfg.inactivityRetry * 1000);
+        if (!conn._cfg.mockPort && conn._cfg.inactivityRetry > 0) conn.connTimer = setTimeout(() => conn.openAsync(), conn._cfg.inactivityRetry * 1000);
     }
     public isRTS: boolean=true;
     public emitter: EventEmitter;
-    public open(timeOut?: string) {
-        if (conn._cfg.netConnect && !conn._cfg.mockPort) {
-            let nc: net.Socket;
-            nc = new net.Socket();
-            conn._port = nc;
-            nc.connect(conn._cfg.netPort, conn._cfg.netHost, function () {
-                if (timeOut === 'retry_timeout' || timeOut === 'timeout')
-                    logger.warn('Net connect (socat) trying to recover from lost connection.');
+    public async openAsync(): Promise<boolean> {
+        if (typeof (this.buffer) === 'undefined') {
+            this.buffer = new SendRecieveBuffer();
+            this.emitter.on('packetread', (pkt) => { this.buffer.pushIn(pkt); });
+            this.emitter.on('messagewrite', (msg) => { this.buffer.pushOut(msg); });
+        }
+        if (this._cfg.netConnect && !this._cfg.mockPort) {
+            if (typeof this._port !== 'undefined' && this._port.isOpen) {
+                // This used to try to reconnect and recreate events even though the socket was already connected.  This resulted in
+                // instances where multiple event processors were present.
+                return Promise.resolve(true);
+            }
+            let nc: net.Socket = new net.Socket();
+            nc.on('connect', () => { logger.info(`Net connect (socat) connected to: ${this._cfg.netHost}:${this._cfg.netPort}`); }); // Socket is opened but not yet ready.
+            nc.on('ready', () => {
+                logger.info(`Net connect (socat) ready and communicating: ${this._cfg.netHost}:${this._cfg.netPort}`);
+                nc.on('data', (data) => { if (data.length > 0 && !this.isPaused) this.emitter.emit('packetread', data); });
             });
-            nc.on('data', function (data) {
-                conn.isOpen = true;
-                if (timeOut === 'retry_timeout' || timeOut === 'timeout') {
-                    logger.info(`Net connect (socat) connected to: ${conn._cfg.netHost}:${conn._cfg.netPort}`);
-                    timeOut = undefined;
-                }
-                if (data.length > 0 && !conn.isPaused) conn.emitter.emit('packetread', data);
-                conn.resetConnTimer('timeout');
+            nc.on('close', (p) => {
+                this.isOpen = false;
+                if (typeof this._port !== 'undefined') this._port.destroy();
+                this._port = undefined;
+                logger.info(`Net connect (socat) closed ${p === true ? 'due to error' : ''}: ${this._cfg.netHost}:${this._cfg.netPort}`);
+            });
+            nc.on('end', () => { // Happens when the other end of the socket closes.
+                this.isOpen = false;
+                this.resetConnTimer();
+                logger.info(`The end event was fired`);
+            }); 
+            //nc.on('drain', () => { logger.info(`The drain event was fired.`); });
+            //nc.on('lookup', (o) => { logger.info(`The lookup event was fired ${o}`); });
+            // Occurs when there is no activity.  This should not reset the connection, the previous implementation did so and
+            // left the connection in a weird state where the previous connection was processing events and the new connection was
+            // doing so as well.  This isn't an error it is a warning as the RS485 bus will most likely be communicating at all times.
+            nc.on('timeout', () => { logger.warn(`Connection Idle: ${this._cfg.netHost}:${this._cfg.netPort}`); });
+            return new Promise<boolean>((resolve, reject) => {
+                // We only connect an error once as we will destroy this connection on error then recreate a new socket on failure.
+                nc.once('error', (err) => {
+                    logger.error(`Connection: ${err}. ${this._cfg.inactivityRetry > 0 ? `Retry in ${this._cfg.inactivityRetry} seconds` : `Never retrying; inactivityRetry set to ${this._cfg.inactivityRetry}`}`);
+                    this.resetConnTimer();
+                    this.isOpen = false;
+                    resolve(false);
+                });
+                nc.connect(conn._cfg.netPort, conn._cfg.netHost, () => {
+                    if (typeof this._port !== 'undefined') logger.warn('Net connect (socat) recovered from lost connection.');
+                    this._port = nc;
+                    this.isOpen = true;
+                    resolve(true);
+                });
             });
         }
         else {
-            var sp: SerialPort = null;
-            if (conn._cfg.mockPort) {
+            if (typeof this._port !== 'undefined' && this._port.isOpen) {
+                // This used to try to reconnect even though the serial port was already connected.  This resulted in
+                // instances where an access denied error was emitted.
+                this.resetConnTimer();
+                return Promise.resolve(true);
+            }
+            let sp: SerialPort = null;
+            if (this._cfg.mockPort) {
                 this.mockPort = true;
                 SerialPort.Binding = MockBinding;
                 let portPath = 'FAKE_PORT';
@@ -72,67 +111,138 @@ export class Connection {
                 this.mockPort = false;
                 sp = new SerialPort(conn._cfg.rs485Port, conn._cfg.portSettings);
             }
-
-            conn._port = sp;
-            sp.open(function(err) {
-                if (err) {
-                    conn.resetConnTimer();
-                    conn.isOpen = false;
-                    logger.error(`Error opening port: ${err.message}. ${conn._cfg.inactivityRetry > 0 ? `Retry in ${conn._cfg.inactivityRetry} seconds` : `Never retrying; inactivityRetry set to ${conn._cfg.inactivityRetry}`}`);
-                }
-                else
-                    logger.info(`Serial port: ${ this.path } request to open succeeded without error`);
-            });
-            sp.on('open', function() {
-                if (timeOut === 'retry_timeout' || timeOut === 'timeout')
-                    logger.error('Serial port %s recovering from lost connection', conn._cfg.rs485Port);
-                else
-                    logger.info(`Serial port: ${ this.path } opened`);
-                conn.isOpen = true;
-            });
-            // RKS: 06-16-20 -- Unsure why we are using a stream event here.  The data
-            // is being sent via the data event and I can find no reference to the readable event.
-            sp.on('data', function (data) {
-                if (!this.mockPort) {
-                    if (!conn.isPaused) conn.emitter.emit('packetread', data);
-                }
-                conn.resetConnTimer();
-            });
-            //sp.on('readable', function () {
-            //    if (!this.mockPort) {
-            //        // If we are paused just read the port and do nothing with it.
-            //        if (conn.isPaused)
-            //            sp.read();
-            //        else
-            //            conn.emitter.emit('packetread', sp.read());
-            //        conn.resetConnTimer();
-            //    }
-            //});
-
-        }
-        if (typeof (conn.buffer) === 'undefined') {
-            conn.buffer = new SendRecieveBuffer();
-            conn.emitter.on('packetread', function(pkt) { conn.buffer.pushIn(pkt); });
-            conn.emitter.on('messagewrite', function(msg) { conn.buffer.pushOut(msg); });
-        }
-        conn.resetConnTimer('retry_timeout');
-        conn._port.on('error', function(err) {
-            logger.error(`Error opening port: ${err.message}. ${conn._cfg.inactivityRetry > 0 ? `Retry in ${conn._cfg.inactivityRetry} seconds` : `Never retrying; inactivityRetry set to ${conn._cfg.inactivityRetry}`}`);
-            conn.resetConnTimer();
-            conn.isOpen = false;
-        });
-    }
-    public close() {
-        if (conn.connTimer) clearTimeout(conn.connTimer);
-        if (typeof (conn._port) !== 'undefined' && conn._cfg.netConnect) {
-            if (typeof (conn._port.destroy) !== 'function')
-                conn._port.close(function(err) {
-                    if (err) logger.error('Error closing %s:%s', conn._cfg.netHost, conn._cfg.netPort);
+            return new Promise<boolean>((resolve, _) => {
+                // The serial port open method calls the callback just once.  Unfortunately that is not the case for
+                // network serial port connections.  There really isn't a way to make it syncronous.  The openAsync will truly
+                // be open if a hardware interface is used and this method returns.
+                sp.open((err) => {
+                    if (err) {
+                        this.resetConnTimer();
+                        this.isOpen = false;
+                        logger.error(`Error opening port: ${err.message}. ${this._cfg.inactivityRetry > 0 ? `Retry in ${this._cfg.inactivityRetry} seconds` : `Never retrying; inactivityRetry set to ${this._cfg.inactivityRetry}`}`);
+                        resolve(false);
+                    }
+                    else resolve(true);
                 });
-            else
-                conn._port.destroy();
+                // The event processors below should not resolve or reject the promise.  This is the misnomer with the stupid javascript promise
+                // structure when dealing with serial ports.  The original promise will be either accepted or rejected above with the open method.  These 
+                // won't be called until long after the promise is resolved above.  Yes we should never reject this promise.  The resolution is true
+                // for a successul connect and false otherwise.
+                sp.on('open', () => {
+                    if (typeof conn._port !== 'undefined') logger.info(`Serial Port: ${this._cfg.rs485Port} recovered from lost connection.`)
+                    else logger.info(`Serial port: ${this._cfg.rs485Port} request to open successful`);
+                    this._port = sp;
+                    this.isOpen = true;
+                    sp.on('data', (data) => { if (!this.mockPort && !this.isPaused) this.emitter.emit('packetread', data); this.resetConnTimer(); });
+                    this.resetConnTimer();
+                });
+                sp.on('close', (err) => {
+                    this.isOpen = false;
+                    logger.info(`Serial port has been closed: ${err ? JSON.stringify(err) : ''}`);
+                });
+                sp.on('error', (err) => {
+                    this.isOpen = false;
+                    if (sp.isOpen) sp.close((err) => { }); // call this with the error callback so that it doesn't emit to the error again.
+                    this.resetConnTimer();
+                    logger.error(`An error occurred on Port: ${this._cfg.rs485Port}: ${JSON.stringify(err)}`);
+                });
+            });
         }
-        conn.buffer.close();
+    }
+    //public open(timeOut?: string) {
+    //    if (conn._cfg.netConnect && !conn._cfg.mockPort) {
+    //        if (typeof conn._port !== 'undefined' !&& conn._port.destroyed) conn._port.destroy();
+    //        let nc = conn._port = new net.Socket();
+    //        nc.connect(conn._cfg.netPort, conn._cfg.netHost, function () {
+    //            if (timeOut === 'retry_timeout' || timeOut === 'timeout')
+    //                logger.warn('Net connect (socat) trying to recover from lost connection.');
+    //        });
+    //        nc.on('data', function (data) {
+    //            conn.isOpen = true;
+    //            if (timeOut === 'retry_timeout' || timeOut === 'timeout') {
+    //                logger.info(`Net connect (socat) connected to: ${conn._cfg.netHost}:${conn._cfg.netPort}`);
+    //                timeOut = undefined;
+    //            }
+    //            if (data.length > 0 && !conn.isPaused) conn.emitter.emit('packetread', data);
+    //            conn.resetConnTimer('timeout');
+    //        });
+    //    }
+    //    else {
+    //        var sp: SerialPort = null;
+    //        if (conn._cfg.mockPort) {
+    //            this.mockPort = true;
+    //            SerialPort.Binding = MockBinding;
+    //            let portPath = 'FAKE_PORT';
+    //            MockBinding.createPort(portPath, { echo: false, record: true });
+    //            sp = new SerialPort(portPath, { autoOpen: false });
+    //        }
+    //        else {
+    //            this.mockPort = false;
+    //            sp = new SerialPort(conn._cfg.rs485Port, conn._cfg.portSettings);
+    //        }
+
+    //        conn._port = sp;
+    //        sp.open(function(err) {
+    //            if (err) {
+    //                conn.resetConnTimer();
+    //                conn.isOpen = false;
+    //                logger.error(`Error opening port: ${err.message}. ${conn._cfg.inactivityRetry > 0 ? `Retry in ${conn._cfg.inactivityRetry} seconds` : `Never retrying; inactivityRetry set to ${conn._cfg.inactivityRetry}`}`);
+    //            }
+    //            else
+    //                logger.info(`Serial port: ${ this.path } request to open succeeded without error`);
+    //        });
+    //        sp.on('open', function() {
+    //            if (timeOut === 'retry_timeout' || timeOut === 'timeout')
+    //                logger.error('Serial port %s recovering from lost connection', conn._cfg.rs485Port);
+    //            else
+    //                logger.info(`Serial port: ${ this.path } opened`);
+    //            conn.isOpen = true;
+    //        });
+    //        // RKS: 06-16-20 -- Unsure why we are using a stream event here.  The data
+    //        // is being sent via the data event and I can find no reference to the readable event.
+    //        sp.on('data', function (data) {
+    //            if (!this.mockPort) {
+    //                if (!conn.isPaused) conn.emitter.emit('packetread', data);
+    //            }
+    //            conn.resetConnTimer();
+    //        });
+    //        //sp.on('readable', function () {
+    //        //    if (!this.mockPort) {
+    //        //        // If we are paused just read the port and do nothing with it.
+    //        //        if (conn.isPaused)
+    //        //            sp.read();
+    //        //        else
+    //        //            conn.emitter.emit('packetread', sp.read());
+    //        //        conn.resetConnTimer();
+    //        //    }
+    //        //});
+
+    //    }
+    //    if (typeof (conn.buffer) === 'undefined') {
+    //        conn.buffer = new SendRecieveBuffer();
+    //        conn.emitter.on('packetread', function(pkt) { conn.buffer.pushIn(pkt); });
+    //        conn.emitter.on('messagewrite', function(msg) { conn.buffer.pushOut(msg); });
+    //    }
+    //    conn.resetConnTimer('retry_timeout');
+    //    conn._port.on('error', function(err) {
+    //        logger.error(`Error opening port: ${err.message}. ${conn._cfg.inactivityRetry > 0 ? `Retry in ${conn._cfg.inactivityRetry} seconds` : `Never retrying; inactivityRetry set to ${conn._cfg.inactivityRetry}`}`);
+    //        conn.resetConnTimer();
+    //        conn.isOpen = false;
+    //    });
+    //}
+    public closeAsync() {
+        try {
+            if (conn.connTimer) clearTimeout(conn.connTimer);
+            if (typeof (conn._port) !== 'undefined' && conn._cfg.netConnect) {
+                if (typeof (conn._port.destroy) !== 'function')
+                    conn._port.close(function (err) {
+                        if (err) logger.error('Error closing %s:%s', conn._cfg.netHost, conn._cfg.netPort);
+                    });
+                else
+                    conn._port.destroy();
+            }
+            conn.buffer.close();
+        } catch (err) { logger.error(`Error closing comms connection: ${err.message}`); }
     }
     public drain(cb: Function) {
         if (typeof (conn._port.drain) === 'function')
@@ -141,15 +251,19 @@ export class Connection {
             cb();
     }
     public write(bytes: Buffer, cb: Function) {
-        if (conn._cfg.netConnect)
+        if (conn._cfg.netConnect) {
+            // SOCAT drops the connection and destroys the stream.  Could be weeks or as little as a day.
+            if (typeof conn._port === 'undefined' || conn._port.destroyed !== false) conn.openAsync();
             conn._port.write(bytes, 'binary', cb);
+        }
         else
             conn._port.write(bytes, cb);
     }
     public async stopAsync() {
-        Promise.resolve()
-            .then(function() { conn.close(); })
-            .then(function() { console.log('closed connection'); });
+        try {
+            await conn.closeAsync();
+            logger.info(`Closed serial communications connection.`);
+        } catch (err) { logger.error(`Error closing comms connection: ${err.message}`); }
     }
     public init() {
         conn._cfg = config.getSection('controller.comms', {
@@ -161,7 +275,35 @@ export class Connection {
             netPort: 9801,
             inactivityRetry: 10
         });
-        conn.open();
+        conn.openAsync();
+        config.emitter.on('reloaded', () => {
+            console.log('Config reloaded');
+            this.reloadConfig(config.getSection('controller.comms', {
+                rs485Port: "/dev/ttyUSB0",
+                portSettings: { baudRate: 9600, dataBits: 8, parity: 'none', stopBits: 1, flowControl: false, autoOpen: false, lock: false },
+                mockPort: false,
+                netConnect: false,
+                netHost: "raspberrypi",
+                netPort: 9801,
+                inactivityRetry: 10
+            }));
+        });
+    }
+    public reloadConfig(cfg) {
+        let c = extend({
+            rs485Port: "/dev/ttyUSB0",
+            portSettings: { baudRate: 9600, dataBits: 8, parity: 'none', stopBits: 1, flowControl: false, autoOpen: false, lock: false },
+            mockPort: false,
+            netConnect: false,
+            netHost: "raspberrypi",
+            netPort: 9801,
+            inactivityRetry: 10
+        }, cfg);
+        if (JSON.stringify(c) !== JSON.stringify(this._cfg)) {
+            this.closeAsync();
+            this._cfg = c;
+            this.openAsync();
+        }
     }
     public queueSendMessage(msg: Outbound) { conn.emitter.emit('messagewrite', msg); }
     public pause() { conn.isPaused = true; conn.buffer.clear(); conn.drain(function (err) { }); }
@@ -381,39 +523,57 @@ export class SendRecieveBuffer {
         // that we also need.  This occurs when more than one panel on the bus requests a reconfig at the same time.
         if (typeof (callback) === 'function') { setTimeout(callback, 100, msgOut); }
     }
+    private processCompletedMessage(msg: Inbound, ndx): number {
+        msg.timestamp = new Date();
+        msg.id = Message.nextMessageId;
+        conn.buffer.counter.collisions += msg.collisions;
+        if (msg.isValid) {
+            conn.buffer.counter.success++;
+            msg.process();
+            conn.buffer.clearResponses(msg);
+        }
+        else {
+            conn.buffer.counter.failed++;
+            console.log('RS485 Stats:' + JSON.stringify(conn.buffer.counter));
+            ndx = this.rewindFailedMessage(msg, ndx);
+        }
+        logger.packet(msg);
+        return ndx;
+    }
+    private rewindFailedMessage(msg: Inbound, ndx: number): number {
+        // Lets see if we can do a rewind to capture another message from the 
+        // crap on the bus.  This will get us to the innermost message.  While the outer message may have failed the inner message should
+        // be able to buck up and make it happen.
+        conn.buffer._inBytes = conn.buffer._inBytes.slice(ndx);  // Start by removing all of the bytes related to the original message.
+        // Add all of the elements of the message back in reverse.
+        conn.buffer._inBytes.unshift(...msg.term);
+        conn.buffer._inBytes.unshift(...msg.payload);
+        conn.buffer._inBytes.unshift(...msg.header.slice(1)); // Trim off the first byte from the header.  This means it won't find 16,2 or start with a 165. The
+        // algorithm looks for the header bytes to determine the protocol so the rewind shouldn't include the 16 in 16,2 otherwise it will just keep rewinding.
+        conn.buffer._msg = msg = new Inbound();
+        ndx = msg.readPacket(conn.buffer._inBytes);
+        if (msg.isComplete) { ndx = this.processCompletedMessage(msg, ndx); }
+        return ndx;
+    }
     protected processInbound() {
         conn.buffer.counter.bytesReceived += conn.buffer._inBuffer.length;
         conn.buffer._inBytes.push.apply(conn.buffer._inBytes, conn.buffer._inBuffer.splice(0, conn.buffer._inBuffer.length));
         if (conn.buffer._inBytes.length >= 1) { // Wait until we have something to process.
-            var ndx: number = 0;
-            var msg: Inbound = conn.buffer._msg;
+            let ndx: number = 0;
+            let msg: Inbound = conn.buffer._msg;
             do {
                 if (typeof (msg) === 'undefined' || msg === null || msg.isComplete || !msg.isValid) {
                     conn.buffer._msg = msg = new Inbound();
                     ndx = msg.readPacket(conn.buffer._inBytes);
                 }
-                else {
-                    ndx = msg.mergeBytes(conn.buffer._inBytes);
+                else ndx = msg.mergeBytes(conn.buffer._inBytes);
+                if (msg.isComplete) ndx = this.processCompletedMessage(msg, ndx);
+                if (ndx > 0) {
+                    conn.buffer._inBytes = conn.buffer._inBytes.slice(ndx);
+                    ndx = 0;
                 }
-                if (msg.isComplete) {
-                    msg.timestamp = new Date();
-                    msg.id = Message.nextMessageId;
-                    if (msg.isValid) {
-                        conn.buffer.counter.success++;
-                        msg.process();
-                        conn.buffer.clearResponses(msg);
-                    }
-                    else {
-                        conn.buffer.counter.failed++;
-                        console.log('Failed:' + JSON.stringify(conn.buffer.counter));
-                        //console.log(JSON.stringify(conn.buffer._inBytes));
-                    }
-                    logger.packet(msg);
-                    conn.buffer._msg = null;
-                }
-                if (ndx > 0) conn.buffer._inBytes = conn.buffer._inBytes.slice(ndx);
                 else break;
-                ndx = 0;
+
             } while (ndx < conn.buffer._inBytes.length);
         }
     }
@@ -424,10 +584,12 @@ export class Counter {
         this.success = 0;
         this.failed = 0;
         this.bytesSent = 0;
+        this.collisions = 0;
     }
     public bytesReceived: number;
     public success: number;
     public failed: number;
     public bytesSent: number;
+    public collisions: number;
 }
 export var conn: Connection = new Connection();

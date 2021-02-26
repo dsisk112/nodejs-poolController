@@ -40,9 +40,9 @@ export class CircuitGroupMessage {
                 CircuitGroupMessage.processEggTimer(msg);
                 break;
             case 35:
-                CircuitGroupMessage.processEggTimer(msg);
-                CircuitGroupMessage.processColor(msg);
-                break;
+                //CircuitGroupMessage.processEggTimer(msg);
+                //CircuitGroupMessage.processColor(msg);
+                //break;
             case 36:
             case 37:
             case 38:
@@ -66,21 +66,18 @@ export class CircuitGroupMessage {
                 
         }
         if (msgId <= 15) {
-            var circuitId = 1;
             groupId = msg.extractPayloadByte(1) + sys.board.equipmentIds.circuitGroups.start;
             group = sys.circuitGroups.getInterfaceById(groupId);
             if (group.isActive) {
-                group.circuits.clear();
-                // Circuit #
-                for (let i = 2; i < msg.payload.length && circuitId <= this.maxCircuits; i++) {
-                    if (msg.extractPayloadByte(i) !== 255) {
-                        if (group.type === 1 && msg.extractPayloadByte(i + 1) !== 0)
-                            group.circuits.add({ id: circuitId, circuit: msg.extractPayloadByte(i) + 1, swimDelay: msg.extractPayloadByte(i + 16) });
-                        else
-                            group.circuits.add({ id: circuitId, circuit: msg.extractPayloadByte(i) + 1 });
-
+                for (let i = 0; i < msg.payload.length && i < 15; i++) {
+                    let circuitId = msg.extractPayloadByte(i + 2) + 1;
+                    if (circuitId < 255) {
+                        let circuit = group.circuits.getItemByIndex(i, true, { id: i + 1 });
+                        circuit.circuit = circuitId;
+                        if (group.type === 1) (circuit as LightGroupCircuit).swimDelay = msg.extractPayloadByte(i + 18);
                     }
-                    circuitId++;
+                    else
+                        group.circuits.removeItemByIndex(i);
                 }
             }
         }
@@ -114,6 +111,7 @@ export class CircuitGroupMessage {
             group.nameId = sgroup.nameId = feature.nameId;
             group.type = sgroup.type = sys.board.valueMaps.circuitGroupTypes.getValue('circuit'); 
             group.isActive = _isActive;
+            if (typeof group.showInFeatures === 'undefined') sgroup.showInFeatures = group.showInFeatures = true;
             let circuits: CircuitGroupCircuitCollection = group.circuits;
             for (let byte = 1; byte <= 7; byte++){
                 let offByte = msg.extractPayloadByte(byte);
@@ -123,12 +121,14 @@ export class CircuitGroupMessage {
                     if (offByte & 1) {
                         let circuit = circuits.getItemById(ndx, true);
                         circuit.circuit = ndx;
-                        circuit.desiredStateOn = false;
+                        circuit.desiredState = 0;
+                        //circuit.desiredStateOn = false;
                     }
                     else if (onByte & 1) {
                         let circuit = circuits.getItemById(ndx, true);
                         circuit.circuit = ndx;
-                        circuit.desiredStateOn = true;
+                        circuit.desiredState = 1;
+                        //circuit.desiredStateOn = true;
                     }
                     else circuits.removeItemById(ndx); 
                     offByte = offByte >> 1;
@@ -176,12 +176,15 @@ export class CircuitGroupMessage {
         for (let i = 0; i < arrlightGrps.length; i++) {
             let group: LightGroup = arrlightGrps[i];
             let sgroup: LightGroupState = state.lightGroups.getItemById(group.id, true);
+            group.isActive = sgroup.isActive = true;
             sgroup.type = group.type;
             sgroup.lightingTheme = group.lightingTheme;
         }
         for (let i = 0; i < arrCircuitGrps.length; i++) {
             let group: CircuitGroup = arrCircuitGrps[i];
             let sgroup: CircuitGroupState = state.circuitGroups.getItemById(group.id, true);
+            group.isActive = sgroup.isActive = true;
+            if (typeof group.showInFeatures === 'undefined') group.showInFeatures = true;
             sgroup.type = group.type;
         }
         state.emitEquipmentChanges();
@@ -191,10 +194,19 @@ export class CircuitGroupMessage {
         var group: ICircuitGroup = sys.circuitGroups.getInterfaceById(groupId++);
         if (group.isActive && group.type === 1) {
             let lg = group as LightGroup;
-            for (let j = 1; j <= 16 && j < msg.payload.length && j <= lg.circuits.length; j++) {
-                let circuit = lg.circuits.getItemById(j);
-                circuit.color = msg.extractPayloadByte(j + 17);
+            for (let j = 0; j < 16; j++) {
+                let circuit = lg.circuits.getItemById(j + 1);
+                circuit.color = msg.extractPayloadByte(j + 2);
             }
+        }
+        else if (group.isActive && group.type === 2) {
+            let g = group as CircuitGroup;
+            for (let j = 0; j < 16 && j < msg.payload.length; j++) {
+                let circuit = g.circuits.getItemById(j + 1);
+                let state = msg.extractPayloadByte(j + 18);
+                circuit.desiredState = state !== 255 ? state : 3;
+            }
+
         }
     }
     private static processEggTimer(msg: Inbound) {

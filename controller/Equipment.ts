@@ -18,7 +18,6 @@ import * as path from "path";
 import * as fs from "fs";
 import * as extend from "extend";
 import * as util from "util";
-
 import { setTimeout } from "timers";
 import { logger } from "../logger/Logger";
 import { state, CommsState } from "./State";
@@ -30,6 +29,7 @@ import { BoardFactory } from "./boards/BoardFactory";
 import { EquipmentStateMessage } from "./comms/messages/status/EquipmentStateMessage";
 import { conn } from './comms/Comms';
 import { versionCheck } from "../config/VersionCheck";
+import { NixieControlPanel } from "./nixie/Nixie";
 interface IPoolSystem {
     cfgPath: string;
     data: any;
@@ -44,6 +44,7 @@ interface IPoolSystem {
     features: FeatureCollection;
     pumps: PumpCollection;
     chlorinators: ChlorinatorCollection;
+    filters: FilterCollection;
     valves: ValveCollection;
     heaters: HeaterCollection;
     covers: CoverCollection;
@@ -52,10 +53,7 @@ interface IPoolSystem {
     eggTimers: EggTimerCollection;
     security: Security;
     chemControllers: ChemControllerCollection;
-    //intellichem: IntelliChem;
     board: SystemBoard;
-    // virtualChlorinatorControllers: VirtualChlorinatorControllerCollection;
-    // virtualPumpControllers: VirtualPumpControllerCollection;
     updateControllerDateTimeAsync(
         hour: number,
         min: number,
@@ -96,14 +94,12 @@ export class PoolSystem implements IPoolSystem {
         this.security = new Security(this.data, 'security');
         this.customNames = new CustomNameCollection(this.data, 'customNames');
         this.eggTimers = new EggTimerCollection(this.data, 'eggTimers');
-        //this.intellichem = new IntelliChem(this.data, 'intellichem');
         this.chemControllers = new ChemControllerCollection(this.data, 'chemControllers');
+        this.filters = new FilterCollection(this.data, 'filters');
         this.data.appVersion = state.appVersion.installed = this.appVersion =  JSON.parse(fs.readFileSync(path.posix.join(process.cwd(), '/package.json'), 'utf8')).version;
         versionCheck.compare(); // if we installed a new version, reset the flag so we don't show an outdated message for up to 2 days 
         this.board = BoardFactory.fromControllerType(this.controllerType, this);
-        // this.intellibrite = new LightGroup(this.data, 'intellibrite', { id: 0, isActive: false, type: 3 });
     }
-
     // This performs a safe load of the config file.  If the file gets corrupt or actually does not exist
     // it will not break the overall system and allow hardened recovery.
     public async updateControllerDateTimeAsync(obj: any) { return sys.board.system.setDateTimeAsync(obj); }
@@ -145,33 +141,31 @@ export class PoolSystem implements IPoolSystem {
         }
     }
     public resetData() {
-        this.circuitGroups.clear();
-        this.lightGroups.clear();
-        this.circuits.clear();
-        this.bodies.clear();
-        this.chlorinators.clear();
+        this.circuitGroups.clear(0);
+        this.lightGroups.clear(0);
+        this.circuits.clear(0);
+        this.bodies.clear(0);
+        this.chlorinators.clear(0);
         this.configVersion.clear();
-        this.covers.clear();
-        this.customNames.clear();
+        this.covers.clear(0);
+        this.customNames.clear(0);
         this.equipment.clear();
-        this.features.clear();
+        this.features.clear(0);
         this.data.general = {};
-        this.heaters.clear();
-        this.pumps.clear();
-        this.remotes.clear();
-        this.schedules.clear();
+        this.heaters.clear(0);
+        this.pumps.clear(0);
+        this.remotes.clear(0);
+        this.schedules.clear(0);
         this.security.clear();
-        this.valves.clear();
-        this.chemControllers.clear();
-        //if (typeof this.data.intelliBrite !== 'undefined') this.intellibrite.clear();
+        this.valves.clear(0);
+        this.chemControllers.clear(0);
+        this.filters.clear(0);
         if (typeof this.data.eggTimers !== 'undefined') this.eggTimers.clear();
-        //this.intellichem.clear();
-        //console.log(this.configVersion);
-       
     }
     public async stopAsync() {
         if (this._timerChanges) clearTimeout(this._timerChanges);
         if (this._timerDirty) clearTimeout(this._timerDirty);
+        logger.info(`Shut down sys (config) object timers`);
         return this.board.stopAsync();
     }
     public searchForAdditionalDevices() {
@@ -200,7 +194,8 @@ export class PoolSystem implements IPoolSystem {
         }  
 
      }
-    public board: SystemBoard=new SystemBoard(this);
+    public board: SystemBoard = new SystemBoard(this);
+    public ncp: NixieControlPanel = new NixieControlPanel();
     public processVersionChanges(ver: ConfigVersion) { this.board.requestConfiguration(ver); }
     public checkConfiguration() { this.board.checkConfiguration(); }
     public cfgPath: string;
@@ -230,6 +225,7 @@ export class PoolSystem implements IPoolSystem {
     public security: Security;
     public customNames: CustomNameCollection;
     public chemControllers: ChemControllerCollection;
+    public filters: FilterCollection;
     public appVersion: string;
     public get dirty(): boolean { return this._isDirty; }
     public set dirty(val) {
@@ -255,6 +251,21 @@ export class PoolSystem implements IPoolSystem {
         Promise.resolve()
             .then(() => { fs.writeFileSync(sys.cfgPath, JSON.stringify(sys.data, undefined, 2)); })
             .catch(function(err) { if (err) logger.error('Error writing pool config %s %s', err, sys.cfgPath); });
+    }
+    // We are doing this because TS is lame. Accessing the app servers from the routes causes a cyclic include.
+    public findServersByType(type: string) {
+        let srv = [];
+        let servers = webApp.findServersByType(type);
+        for (let i = 0; i < servers.length; i++) {
+            srv.push({
+                uuid: servers[i].uuid,
+                name: servers[i].name,
+                type: servers[i].type,
+                isRunning: servers[i].isRunning,
+                isConnected: servers[i].isConnected
+            });
+        }
+        return srv;
     }
     protected onchange=(obj, fn) => {
         const handler = {
@@ -331,6 +342,7 @@ interface IEqItem {
     clear();
     hasChanged: boolean;
     get(bCopy: boolean);
+    master: number;
 }
 class EqItem implements IEqItemCreator<EqItem>, IEqItem {
     public dataName: string;
@@ -341,14 +353,21 @@ class EqItem implements IEqItemCreator<EqItem>, IEqItem {
             sys._hasChanged = true;
         }
     }
+    public get master(): number | any { return this.data.master || 0; }
+    public set master(val: number | any) { this.setDataVal('master', sys.board.valueMaps.equipmentMaster.encode(val)); }
     ctor(data, name?: string): EqItem { return new EqItem(data, name); }
     constructor(data, name?: string) {
         if (typeof name !== 'undefined') {
             if (typeof data[name] === 'undefined') data[name] = {};
             this.data = data[name];
             this.dataName = name;
-        } else this.data = data;
+            this.initData();
+        } else {
+            this.data = data;
+            this.initData();
+        }
     }
+    public initData() { if (typeof this.data.master === 'undefined') this.data.master = sys.board.equipmentMaster; }
     public get(bCopy?: boolean): any {
         // RSG: 7/2/20 - extend was deep copying arrays (eg pump circuits) by reference
         // return bCopy ? extend(true, {}, this.data) : this.data;
@@ -361,7 +380,7 @@ class EqItem implements IEqItemCreator<EqItem>, IEqItem {
         }
     }
     // This is a tricky endeavor.  If we run into a collection then we need to obliterate the existing data and add in our data.
-     public set(data: any) {
+    public set(data: any) {
         let op = Object.getOwnPropertyNames(Object.getPrototypeOf(this))
         for (let i in op) {
             let prop = op[i];
@@ -395,6 +414,17 @@ class EqItem implements IEqItemCreator<EqItem>, IEqItem {
         else if (typeof persist !== 'undefined' && persist) this.hasChanged = true;
     }
    
+}
+class ChildEqItem extends EqItem {
+    private _pmap = new WeakSet();
+    //private _dataKey = { id: 'parent' };
+    constructor(data: any, name: string, parent) {
+        super(data, name);
+        this._pmap['parent'] = parent;
+    }
+    public getParent() {
+        return this._pmap['parent'];
+    }
 }
 interface IEqItemCollection {
     set(data);
@@ -455,7 +485,7 @@ class EqItemCollection<T> implements IEqItemCollection {
         if (typeof itm !== 'undefined') return this.createItem(itm);
     }
     // This will return a new collection of this type. NOTE: This is a separate object but the data is still attached to the
-    // overall configuration.  This meanse that changes made to the objects in the collection will reflect in the configuration.
+    // overall configuration.  This means that changes made to the objects in the collection will reflect in the configuration.
     // HOWEVER, any of the array manipulation methods like removeItemBy..., add..., or creation methods will not modify the configuration.
     public filter(f: (value: T, index?: any, array?: any[]) => boolean): EqItemCollection<T> {
         return new EqItemCollection<T>(this.data.filter(f));
@@ -470,7 +500,16 @@ class EqItemCollection<T> implements IEqItemCollection {
         return arr;
     }
     public createItem(data: any): T { return (new EqItem(data) as unknown) as T; }
-    public clear() { this.data.length = 0; }
+    public clear(master: number = -1) {
+        if (master === -1)
+            this.data.length = 0;
+        else {
+            for (let i = this.data.length - 1; i >= 0; i--) {
+                if (this.data[i].master === master) this.data.splice(i, 1);
+                console.log(this.data.length);
+            }
+        }
+    }
     public get length(): number { return typeof this.data !== 'undefined' ? this.data.length : 0; }
     public set length(val: number) { if (typeof val !== 'undefined' && typeof this.data !== 'undefined') this.data.length = val; }
     public add(obj: any): T { this.data.push(obj); return this.createItem(obj); }
@@ -515,7 +554,7 @@ class EqItemCollection<T> implements IEqItemCollection {
     }
 }
 export class General extends EqItem {
-    ctor(data): General { return new General(data, name || 'pool'); }
+    ctor(data:any, name?: any): General { return new General(data, name || 'pool'); }
     public get alias(): string { return this.data.alias; }
     public set alias(val: string) { this.setDataVal('alias', val); }
     public get owner(): Owner { return new Owner(this.data, 'owner'); }
@@ -568,6 +607,10 @@ export class TempSensorCollection extends EqItemCollection<TempSensor> {
         return sensor.calibration || 0;
     }
 }
+export class FlowSensorCollection extends EqItemCollection<TempSensor> {
+    constructor(data: any, name?: string) { super(data, name || "flowSensors"); }
+    public createItem(data: any): TempSensor { return new TempSensor(data); }
+}
 export class TempSensor extends EqItem {
     public dataName='sensorConfig';
     public set id(val: string) { this.setDataVal('id', val); }
@@ -599,16 +642,16 @@ export class Options extends EqItem {
     public set pumpDelay(val: boolean) { this.setDataVal('pumpDelay', val); }
     public get cooldownDelay(): boolean { return this.data.cooldownDelay; }
     public set cooldownDelay(val: boolean) { this.setDataVal('cooldownDelay', val); }
-    public get airTempAdj(): number { return typeof this.data.airTempAdj === 'undefined' ? 0 : this.data.airTempAdj; }
-    public set airTempAdj(val: number) { this.setDataVal('airTempAdj', val); }
-    public get waterTempAdj1(): number { return typeof this.data.waterTempAdj1 === 'undefined' ? 0 : this.data.waterTempAdj1; }
-    public set waterTempAdj1(val: number) { this.setDataVal('waterTempAdj1', val); }
-    public get solarTempAdj1(): number { return typeof this.data.solarTempAdj1 === 'undefined' ? 0 : this.data.solarTempAdj1; }
-    public set solarTempAdj1(val: number) { this.setDataVal('solarTempAdj1', val); }
-    public get waterTempAdj2(): number { return typeof this.data.waterTempAdj2 === 'undefined' ? 0 : this.data.waterTempAdj2; }
-    public set waterTempAdj2(val: number) { this.setDataVal('waterTempAdj2', val); }
-    public get solarTempAdj2(): number { return typeof this.data.solarTempAdj2 === 'undefined' ? 0 : this.data.solarTempAdj2; }
-    public set solarTempAdj2(val: number) { this.setDataVal('solarTempAd2', val); }
+    //public get airTempAdj(): number { return typeof this.data.airTempAdj === 'undefined' ? 0 : this.data.airTempAdj; }
+    //public set airTempAdj(val: number) { this.setDataVal('airTempAdj', val); }
+    //public get waterTempAdj1(): number { return typeof this.data.waterTempAdj1 === 'undefined' ? 0 : this.data.waterTempAdj1; }
+    //public set waterTempAdj1(val: number) { this.setDataVal('waterTempAdj1', val); }
+    //public get solarTempAdj1(): number { return typeof this.data.solarTempAdj1 === 'undefined' ? 0 : this.data.solarTempAdj1; }
+    //public set solarTempAdj1(val: number) { this.setDataVal('solarTempAdj1', val); }
+    //public get waterTempAdj2(): number { return typeof this.data.waterTempAdj2 === 'undefined' ? 0 : this.data.waterTempAdj2; }
+    //public set waterTempAdj2(val: number) { this.setDataVal('waterTempAdj2', val); }
+    //public get solarTempAdj2(): number { return typeof this.data.solarTempAdj2 === 'undefined' ? 0 : this.data.solarTempAdj2; }
+    //public set solarTempAdj2(val: number) { this.setDataVal('solarTempAd2', val); }
 }
 export class Location extends EqItem {
     public dataName='locationConfig';
@@ -663,7 +706,10 @@ export class ExpansionPanel extends EqItem {
     public get modules(): ExpansionModuleCollection { return new ExpansionModuleCollection(this.data, "modules"); }
 }
 export class Equipment extends EqItem {
-    public dataName='equipmentConfig';
+    public dataName = 'equipmentConfig';
+    public initData() {
+        
+    }
     public get name(): string { return this.data.name; }
     public set name(val: string) { this.setDataVal('name', val); }
     public get type(): number { return this.data.type; }
@@ -705,8 +751,7 @@ export class Equipment extends EqItem {
     public get maxCustomNames(): number { return this.data.maxCustomNames || 10; }
     public set maxCustomNames(val: number) { this.setDataVal('maxCustomNames', val); }
     public get tempSensors(): TempSensorCollection { return new TempSensorCollection(this.data); }
-
-    // Looking for IntelliCenter 1.029
+    public get flowSensors(): FlowSensorCollection { return new FlowSensorCollection(this.data); }
     public set controllerFirmware(val: string) { this.setDataVal('softwareVersion', val); }
     public get controllerFirmware(): string { return this.data.softwareVersion; }
     public set bootloaderVersion(val: string) { this.setDataVal('bootloaderVersion', val); }
@@ -842,14 +887,26 @@ export class Body extends EqItem {
 export class ScheduleCollection extends EqItemCollection<Schedule> {
     constructor(data: any, name?: string) { super(data, name || "schedules"); }
     public createItem(data: any): Schedule { return new Schedule(data); }
+    public getNextEquipmentId(range: EquipmentIdRange): number {
+    let data = [...this.data, ...sys.eggTimers.get()]
+        for (let i = range.start; i <= range.end; i++) {
+            let eq = data.find(elem => elem.id === i);
+            if (typeof eq === 'undefined') return i;
+        }
+    }
+    
 }
 export class Schedule extends EqItem {
-    constructor(data: any) {
-        super(data);
-        if (typeof data.startDate === 'undefined') this._startDate = new Date();
-        else this._startDate = new Date(data.startDate);
+    constructor(data: any) { super(data); }
+    public initData() {
+        if (typeof this.data.startDate === 'undefined') this._startDate = new Date();
+        else this._startDate = new Date(this.data.startDate);
         if (isNaN(this._startDate.getTime())) this._startDate = new Date();
+        if (typeof this.data.startTimeType === 'undefined') this.data.startTimeType = 0;
+        if (typeof this.data.endTimeType === 'undefined') this.data.endTimeType = 0;
+        if (typeof this.data.display === 'undefined') this.data.display = 0;
     }
+
     // todo: investigate schedules having startDate and _startDate
     private _startDate: Date=new Date();
     public dataName='scheduleConfig';
@@ -865,12 +922,12 @@ export class Schedule extends EqItem {
     public set circuit(val: number) { this.setDataVal('circuit', val); }
     public get heatSource(): number | any { return this.data.heatSource; }
     public set heatSource(val: number | any) { this.setDataVal('heatSource', sys.board.valueMaps.heatSources.encode(val)); }
+    public get changeHeatSetpoint(): boolean { return this.data.changeHeatSetpoint; }
+    public set changeHeatSetpoint(val: boolean) { this.setDataVal('changeHeatSetpoint', val); }
     public get heatSetpoint(): number { return this.data.heatSetpoint; }
     public set heatSetpoint(val: number) { this.setDataVal('heatSetpoint', val); }
     public get isActive(): boolean { return this.data.isActive; }
     public set isActive(val: boolean) { this.setDataVal('isActive', val); }
-    public get runOnce(): number { return this.data.runOnce; }
-    public set runOnce(val: number) { this.setDataVal('runOnce', val); }
     public get startMonth(): number { return this._startDate.getMonth() + 1; }
     public set startMonth(val: number) { this._startDate.setMonth(val - 1); this._saveStartDate(); }
     public get startDay(): number { return this._startDate.getDate(); }
@@ -885,17 +942,11 @@ export class Schedule extends EqItem {
     public set startTimeType(val: number | any) { this.setDataVal('startTimeType', sys.board.valueMaps.scheduleTimeTypes.encode(val)); }
     public get endTimeType(): number | any { return this.data.endTimeType; }
     public set endTimeType(val: number | any) { this.setDataVal('endTimeType', sys.board.valueMaps.scheduleTimeTypes.encode(val)); }
-
-    private _saveStartDate() { this.startDate.setHours(0, 0, 0, 0); this.data.startDate = Timestamp.toISOLocal(this.startDate); }
+    public get display() { return this.data.display; }
+    public set display(val: number | any) { this.setDataVal('display', sys.board.valueMaps.scheduleDisplayTypes.encode(val)); }
+    private _saveStartDate() { this.startDate.setHours(0, 0, 0, 0); this.setDataVal('startDate', Timestamp.toISOLocal(this.startDate)); }
     public get flags(): number { return this.data.flags; }
     public set flags(val: number) { this.setDataVal('flags', val); }
-    // RKS: Talk to Russ about these. The method below was originally set.  Unfortunately, this interacts with proxy and delete should be
-    // replaced by the corresponding deleteAsync call.
-    public setSchedule(obj: any) { sys.board.schedules.setSchedule(this, obj); }
-    public deleteSchedule() {
-        this.circuit = 0;
-        sys.board.schedules.setSchedule(this);
-    }
 }
 // TODO: Get rid of this
 export class EggTimerCollection extends EqItemCollection<EggTimer> {
@@ -920,14 +971,6 @@ export class EggTimer extends EqItem {
     public set circuit(val: number) { this.setDataVal('circuit', val); }
     public get isActive(): boolean { return this.data.isActive; }
     public set isActive(val: boolean) { this.setDataVal('isActive', val); }
-    public setEggTimer(obj?: any) { sys.board.schedules.setSchedule(this, obj); }
-    public deleteEggTimer() {
-        const circuit = sys.circuits.getInterfaceById(this.circuit);
-        circuit.eggTimer = 720;
-        this.circuit = 0;
-        sys.board.schedules.setSchedule(this);
-    }
-
 }
 export class CircuitCollection extends EqItemCollection<Circuit> {
     constructor(data: any, name?: string) { super(data, name || "circuits"); }
@@ -976,9 +1019,9 @@ export class Circuit extends EqItem implements ICircuit {
     public set level(val: number) { this.setDataVal('level', val); }
     public get isActive(): boolean { return this.data.isActive; }
     public set isActive(val: boolean) { this.setDataVal('isActive', val); }
-    public get dontStop(): boolean { return utils.makeBool(this.data.dontStop); }
+    public get dontStop(): boolean { return this.data.dontStop; }
     public set dontStop(val: boolean) { this.setDataVal('dontStop', val); }
-
+    public get hasHeatSource() { return typeof sys.board.valueMaps.circuitFunctions.get(this.type || 0).hasHeatSource !== 'undefined' ? sys.board.valueMaps.circuitFunctions.get(this.type || 0).hasHeatSource : false};
     public getLightThemes() { return sys.board.circuits.getLightThemes(this.type); }
     public static getIdName(id: number) {
         // todo: adjust for intellitouch
@@ -1168,9 +1211,20 @@ export class PumpCircuit extends EqItem {
 export class ChlorinatorCollection extends EqItemCollection<Chlorinator> {
     constructor(data: any, name?: string) { super(data, name || "chlorinators"); }
     public createItem(data: any): Chlorinator { return new Chlorinator(data); }
+    public filter(f: (value: Chlorinator, index?: any, array?: any[]) => boolean): ChlorinatorCollection {
+        return new ChlorinatorCollection({ chlorinators: this.data.filter(f) });
+    }
+    public getByBody(body: number): EqItemCollection<Chlorinator> {
+        return this.filter(elem => elem.body === body ||
+            body === 32 && elem.body <= 2 ||
+            elem.body === 32 && body <= 2);
+    }
 }
 export class Chlorinator extends EqItem {
-    public dataName='chlorinatorConfig';
+    public dataName = 'chlorinatorConfig';
+    public initData() {
+        if (typeof this.data.disabled === 'undefined') this.data.disabled = false;
+    }
     public get id(): number { return this.data.id; }
     public set id(val: number) { this.setDataVal('id', val); }
     public get type(): number | any { return this.data.type; }
@@ -1192,14 +1246,19 @@ export class Chlorinator extends EqItem {
     public get name(): string { return this.data.name; }
     public set name(val: string) { this.setDataVal('name', val); }
     public get isVirtual() { return this.data.isVirtual; }
-    public set isVirtual(val: boolean){ this.setDataVal('isVirtual', val); }
+    public set isVirtual(val: boolean) { this.setDataVal('isVirtual', val); }
+    public get disabled(): boolean { return this.data.disabled; }
+    public set disabled(val: boolean) { this.setDataVal('disabled', val); }
 }
 export class ValveCollection extends EqItemCollection<Valve> {
     constructor(data: any, name?: string) { super(data, name || "valves"); }
     public createItem(data: any): Valve { return new Valve(data); }
 }
 export class Valve extends EqItem {
-    public dataName='valveConfig';
+    public dataName = 'valveConfig';
+    public initData() {
+        if (typeof this.data.type === 'undefined') this.data.type = 0;
+    }
     public get id(): number { return this.data.id; }
     public set id(val: number) { this.setDataVal('id', val); }
     public get type(): number | any { return this.data.type; }
@@ -1212,7 +1271,7 @@ export class Valve extends EqItem {
     public set isIntake(val: boolean) { this.setDataVal('isIntake', val); }
     public get isReturn(): boolean { return utils.makeBool(this.data.isReturn); }
     public set isReturn(val: boolean) { this.setDataVal('isReturn', val); }
-    public get isVirtual(): boolean { return utils.makeBool(this.data.isReturn); }
+    public get isVirtual(): boolean { return utils.makeBool(this.data.isVirtual); }
     public set isVirtual(val: boolean) { this.setDataVal('isVirtual', val); }
     public get pinId(): number { return this.data.pinId || 0; }
     public set pinId(val: number) { this.setDataVal('pinId', val); }
@@ -1239,6 +1298,8 @@ export class Heater extends EqItem {
     public set startTempDelta(val: number) { this.setDataVal('startTempDelta', val); }
     public get stopTempDelta(): number { return this.data.stopTempDelta; }
     public set stopTempDelta(val: number) { this.setDataVal('stopTempDelta', val); }
+    public get cooldownDelay(): number { return this.data.cooldownDelay; }
+    public set cooldownDelay(val: number) { this.setDataVal('cooldownDelay', val); }
     public get address(): number { return this.data.address; }
     public set address(val: number) { this.setDataVal('address', val); }
     public get efficiencyMode(): number { return this.data.efficiencyMode; }
@@ -1290,8 +1351,13 @@ export interface ICircuitGroup {
     dontStop: boolean;
     isActive: boolean;
     lightingTheme?: number;
-    circuits: LightGroupCircuitCollection | CircuitGroupCircuitCollection;
+    showInFeatures?: boolean;
+    circuits: EqItemCollection<ICircuitGroupCircuit>;
     get(copy?: boolean);
+}
+export interface ICircuitGroupCircuit {
+    id: number,
+    circuit:number
 }
 export class LightGroupCollection extends EqItemCollection<LightGroup> {
     constructor(data: any, name?: string) { super(data, name || "lightGroups"); }
@@ -1311,7 +1377,7 @@ export class LightGroupCircuitCollection extends EqItemCollection<LightGroupCirc
     }
     public removeItemByCircuitId(id: number): LightGroupCircuit {
         let rem: LightGroupCircuit = null;
-        for (let i = 0; i < this.data.length; i++)
+        for (let i = this.data.length - 1; i >= 0; i--)
             if (typeof this.data[i].circuit !== 'undefined' && this.data[i].circuit === id) {
                 rem = this.data.splice(i, 1);
             }
@@ -1320,15 +1386,19 @@ export class LightGroupCircuitCollection extends EqItemCollection<LightGroupCirc
     }
     // public sortByPosition() { sys.intellibrite.circuits.sort((a, b) => { return a.position > b.position ? 1 : -1; }); }
 }
-export class LightGroupCircuit extends EqItem {
+export class LightGroupCircuit extends EqItem implements ICircuitGroupCircuit {
     public dataName = 'lightGroupCircuitConfig';
     public get id(): number { return this.data.id; }
     public set id(val: number) { this.setDataVal('id', val); }
     public get circuit(): number { return this.data.circuit; }
     public set circuit(val: number) { this.setDataVal('circuit', val); }
     // RG - these shouldn't be here; only need them for CircuitGroupCircuit but if I remove it getItemById returns an error... to be fixed.
-    public get desiredStateOn(): boolean { return this.data.desiredStateOn; }
-    public set desiredStateOn(val: boolean) { this.setDataVal('desiredStateOn', val); }
+    // RKS: 09-26-20 Deprecated the desiredStateOn property.  There are 3 values for this and they include on-off-ignore.  For non-IC boards these resolve to 0 or 1 for on/off.
+    //public get desiredStateOn(): boolean { return this.data.desiredStateOn; }
+    //public set desiredStateOn(val: boolean) { this.setDataVal('desiredStateOn', val); }
+    public get desiredState(): number { return this.data.desiredState; }
+    public set desiredState(val: number) { this.setDataVal('desiredState', val); }
+
     public get isActive(): boolean { return this.data.isActive; }
     public set isActive(val: boolean) { this.setDataVal('isActive', val, false); }
     public get lightingTheme(): number | any { return this.data.lightingTheme; }
@@ -1369,6 +1439,8 @@ export class LightGroup extends EqItem implements ICircuitGroup, ICircuit {
     public set eggTimer(val: number) { this.setDataVal('eggTimer', val); }
     public get dontStop(): boolean { return utils.makeBool(this.data.dontStop); }
     public set dontStop(val: boolean) { this.setDataVal('dontStop', val); }
+    public get showInFeatures(): boolean { return utils.makeBool(this.data.showInFeatures); }
+    public set showInFeatures(val: boolean) { this.setDataVal('showInFeatures', val); }
     public get lightingTheme(): number | any { return this.data.lightingTheme; }
     public set lightingTheme(val: number | any) { this.setDataVal('lightingTheme', sys.board.valueMaps.lightThemes.encode(val)); }
     public get circuits(): LightGroupCircuitCollection { return new LightGroupCircuitCollection(this.data, "circuits"); }
@@ -1392,16 +1464,19 @@ export class CircuitGroupCircuitCollection extends EqItemCollection<CircuitGroup
     constructor(data: any, name?: string) { super(data, name || 'circuits'); }
     public createItem(data: any): CircuitGroupCircuit { return new CircuitGroupCircuit(data); }
 }
-export class CircuitGroupCircuit extends EqItem {
+export class CircuitGroupCircuit extends EqItem implements ICircuitGroupCircuit {
     public dataName='circuitGroupCircuitConfig';
     public get id(): number { return this.data.id; }
     public set id(val: number) { this.setDataVal('id', val); }
     public get circuit(): number { return this.data.circuit; }
     public set circuit(val: number) { this.setDataVal('circuit', val); }
-    public get desiredStateOn(): boolean { return this.data.desiredStateOn; }
-    public set desiredStateOn(val: boolean) { this.setDataVal('desiredStateOn', val); }
-    public get lightingTheme(): number { return this.data.lightingTheme; }
-    public set lightingTheme(val: number) { this.setDataVal('lightingTheme', val); }
+    // RKS: 09-26-20 Deprecated the desiredStateOn property.  The values are mapped to on-off-ignore in IC and on-off in all other boards.
+    //public get desiredStateOn(): boolean { return this.data.desiredStateOn; }
+    //public set desiredStateOn(val: boolean) { this.setDataVal('desiredStateOn', val); }
+    public get desiredState(): number { return this.data.desiredState; }
+    public set desiredState(val: number) { this.setDataVal('desiredState', val); }
+    //public get lightingTheme(): number { return this.data.lightingTheme; }
+    //public set lightingTheme(val: number) { this.setDataVal('lightingTheme', val); }
     public getExtended() {
         let circ = this.get(true);
         circ.circuit = state.circuits.getInterfaceById(circ.circuit);
@@ -1416,7 +1491,7 @@ export class CircuitGroupCollection extends EqItemCollection<CircuitGroup> {
         if (!iGroup.isActive) iGroup = sys.lightGroups.getItemById(id, false, { id: id, isActive: false });
         return iGroup;
     }
-    public getItemById(id: number, add?: boolean, data?: any): CircuitGroup|LightGroup {
+    public getItemById(id: number, add?: boolean, data?: any): LightGroup | CircuitGroup {
         for (let i = 0; i < this.data.length; i++) {
             if (typeof this.data[i].id !== 'undefined' && this.data[i].id === id) {
                 return this.createItem(this.data[i]);
@@ -1446,6 +1521,9 @@ export class CircuitGroup extends EqItem implements ICircuitGroup, ICircuit {
     public set eggTimer(val: number) { this.setDataVal('eggTimer', val); }
     public get dontStop(): boolean { return utils.makeBool(this.data.dontStop); }
     public set dontStop(val: boolean) { this.setDataVal('dontStop', val); }
+    public get showInFeatures(): boolean { return utils.makeBool(this.data.showInFeatures); }
+    public set showInFeatures(val: boolean) { this.setDataVal('showInFeatures', val); }
+
     public get circuits(): CircuitGroupCircuitCollection { return new CircuitGroupCircuitCollection(this.data, "circuits"); }
     public getExtended() {
         let group = this.get(true);
@@ -1454,6 +1532,7 @@ export class CircuitGroup extends EqItem implements ICircuitGroup, ICircuit {
         let gstate = state.lightGroups.getItemById(this.id).getExtended();
         group.action = gstate.action;
         group.isOn = gstate.isOn;
+        group.showInFeatures = this.showInFeatures;
         group.circuits = [];
         for (let i = 0; i < this.circuits.length; i++) {
             group.circuits.push(this.circuits.getItemByIndex(i).getExtended());
@@ -1540,16 +1619,124 @@ export class ChemControllerCollection extends EqItemCollection<ChemController> {
         if (typeof add !== 'undefined' && add) return this.add(data || { id: this.data.length + 1, address: address });
         return this.createItem(data || { id:this.data.length + 1, address: address });
     }
-    public nextAvailableChemController(): number {
-        for (let i = 1; i <= sys.equipment.maxChemControllers; i++) {
-            let chem = sys.chemControllers.getItemById(i);
-                if (!chem.isActive) return i;
+    //public nextAvailableChemController(): number {
+    //    for (let i = 1; i <= sys.equipment.maxChemControllers; i++) {
+    //        let chem = sys.chemControllers.getItemById(i);
+    //            if (!chem.isActive) return i;
+    //    }
+    //    return undefined;
+    //}
+    public getNextControllerId(type: number): number {
+        let arr = this.toArray();
+        let id = type === 2 ? 0 : 49;
+        for (let i = 0; i < arr.length; i++) {
+            if (arr[i].type === type) id = Math.max(id, arr[i].id);
         }
-        return undefined;
+        return id + 1;
+    }
+}
+export class FlowSensor extends ChildEqItem {
+    public dataName = 'flowSensorConfig';
+    public initData() {
+        if (typeof this.data.type === 'undefined') this.data.type = 0;
+        if (typeof this.data.enabled === 'undefined') this.data.enabled = true;
+        super.initData();
+    }
+    public get enabled(): boolean { return utils.makeBool(this.data.enabled); }
+    public set enabled(val: boolean) { this.setDataVal('enabled', val); }
+    public get connectionId(): string { return this.data.connectionId; }
+    public set connectionId(val: string) { this.setDataVal('connectionId', val); }
+    public get deviceBinding(): string { return this.data.deviceBinding; }
+    public set deviceBinding(val: string) { this.setDataVal('deviceBinding', val); }
+    public get type(): number | any { return this.data.type; }
+    public set type(val: number | any) { this.setDataVal('type', sys.board.valueMaps.chemPumpTypes.encode(val)); }
+    public getExtended() {
+        let sensor = this.get(true);
+        sensor.type = sys.board.valueMaps.flowSensorTypes.transform(this.type);
+        return sensor;
     }
 }
 export class ChemController extends EqItem {
-    public dataName='chemControllerConfig';
+    public initData() {
+        //var chemController = {
+        //    id: 'number',               // Id of the controller
+        //    name: 'string',             // Name assigned to the controller
+        //    type: 'valueMap',           // intellichem, homegrown, rem -- There is an unknown but that should probably go away.
+        //    body: 'valueMap',           // Body assigned to the chem controller.
+        //    address: 'number',          // Address for IntelliChem controller only.
+        //    isActive: 'booean',
+        //    isVirtual: 'boolean',       // False if controlled by OCP.
+        //    calciumHardness: 'number',
+        //    cyanuricAcid: 'number',
+        //    alkalinity: 'number',
+        //    HMIAdvancedDisplay: 'boolean', // This is related to IntelliChem and determines what is displayed on the controller.
+        //    ph: {                           // pH chemical structure
+        //        chemType: 'string',         // Constant ph
+        //        enabled: 'boolean',         // Allows disabling the functions without deleting the settings.
+        //        dosingMethod: 'valueMap',   // manual, volume, volumeTime.
+        //        //  manual = The dosing pump is not triggered.
+        //        //  volume = Time is not considered as a limit to the dosing.
+        //        //  time = The only limit to the dose is the amount of time.
+        //        //  volumeTime = Limit the dose by volume or time whichever is sooner.
+        //        maxDosingTime: 'number',    // The maximum amount of time a dose can occur before mixing.
+        //        maxDosingVolume: 'number',  // The maximum volume for a dose in mL.
+        //        mixingTime: 'number',       // Amount of time between in seconds doses that the pump must run before adding another dose.
+        //        startDelay: 'number',       // The number of seconds that the pump must be running prior to considering a dose.
+        //        setpoint: 'number',         // Target setpoint for pH
+        //        phSupply: 'valueMap',       // base or acid.
+        //        pump: {
+        //            type: 'valueMap',           // none, relay, ezo-pmp
+        //            connectionId: 'uuid',       // Unique identifier for njspc external connections.
+        //            deviceBinding: 'string',    // Binding value for REM to tell it what device is involved.
+        //            ratedFlow: 'number',        // The standard flow rate for the pump in mL/min.
+        //        },
+        //        tank: {
+        //            capacity: 'number',         // Capacity of the tank in the units provided.
+        //            units: 'valueMap'           // gal, mL, cL, L, oz, pt, qt.
+        //        },
+        //        probe: {
+        //            connectionId: 'uuid',       // A unique identifier that has been generated for connections in njspc.
+        //            deviceBinding: 'string',    // A mapping value that is used by REM to determine which device is used.
+        //            type: 'valueMap'            // none, ezo-ph, other.
+        //        }
+
+        //    },
+        //    orp: {                          // ORP chemical structure
+        //        chemType: 'string',         // Constant orp
+        //        enabled: 'boolean',         // Allows disabling the functions without deleting the settings.
+        //        dosingMethod: 'valueMap',   // manual, volume, volumeTime.
+        //        //  manual = The dosing pump is not triggered.
+        //        //  volume = Time is not considered as a limit to the dosing.
+        //        //  time = The only limit to the dose is the amount of time.
+        //        //  volumeTime = Limit the dose by volume or time whichever is sooner.
+        //        maxDosingTime: 'number',    // The maximum amount of time a dose can occur before mixing.
+        //        maxDosingVolume: 'number',  // The maximum volume for a dose in mL.
+        //        mixingTime: 'number',       // Amount of time between in seconds doses that the pump must run before adding another dose.
+        //        startDelay: 'number',       // The number of seconds that the pump must be running prior to considering a dose.
+        //        setpoint: 'number',         // Target setpoint for ORP
+        //        useChlorinator: 'boolean',  // Indicates whether the chlorinator will be used for dosing.
+        //        pump: {
+        //            type: 'valueMap',           // none, relay, ezo-pmp
+        //            connectionId: 'uuid',       // Unique identifier for njspc external connections.
+        //            deviceBinding: 'string',    // Binding value for REM to tell it what device is involved.
+        //            ratedFlow: 'number',        // The standard flow rate for the pump in mL/min.
+        //        },
+        //        tank: {
+        //            capacity: 'number',         // Capacity of the tank in the units provided.
+        //            units: 'valueMap'           // gal, mL, cL, L, oz, pt, qt.
+        //        },
+        //        probe: {
+        //            connectionId: 'uuid',       // A unique identifier that has been generated for connections in njspc.
+        //            deviceBinding: 'string',    // A mapping value that is used by REM to determine which device is used.
+        //            type: 'valueMap'            // none, ezo-orp, other.
+        //        }
+        //    }
+        //}
+        if (typeof this.data.lsiRange === 'undefined') this.data.lsiRange = { low: -.5, high: .5, enabled: true };
+        if (typeof this.data.borates === 'undefined') this.data.borates = 0;
+        super.initData();
+    }
+    public dataName = 'chemControllerConfig';
     public get id(): number { return this.data.id; }
     public set id(val: number) { this.setDataVal('id', val); }
     public get name(): string { return this.data.name; }
@@ -1564,35 +1751,251 @@ export class ChemController extends EqItem {
     public set isActive(val: boolean) { this.setDataVal('isActive', val); }
     public get isVirtual(): boolean { return this.data.isVirtual; }
     public set isVirtual(val: boolean) { this.setDataVal('isVirtual', val); }
-    public get pHSetpoint(): number { return this.data.pHSetpoint; }
-    public set pHSetpoint(val: number) { this.setDataVal('pHSetpoint', val); }
-    public get orpSetpoint(): number { return this.data.orpSetpoint; }
-    public set orpSetpoint(val: number) { this.setDataVal('orpSetpoint', val); }
     public get calciumHardness(): number { return this.data.calciumHardness; }
     public set calciumHardness(val: number) { this.setDataVal('calciumHardness', val); }
     public get cyanuricAcid(): number { return this.data.cyanuricAcid; }
     public set cyanuricAcid(val: number) { this.setDataVal('cyanuricAcid', val); }
     public get alkalinity(): number { return this.data.alkalinity; }
     public set alkalinity(val: number) { this.setDataVal('alkalinity', val); }
-    
-    public get isFlowDelayMode(): boolean { return this.data.isFlowDelayMode; }
-    public set isFlowDelayMode(val: boolean) { this.setDataVal('isFlowDelayMode', val); }
-    public get isIntelliChlorUsed(): boolean { return this.data.isIntelliChlorUsed; }
-    public set isIntelliChlorUsed(val: boolean) { this.setDataVal('isIntelliChlorUsed', val); }
+    public get borates(): number { return this.data.borates; }
+    public set borates(val: number) { this.setDataVal('borates', val); }
+    public get flowSensor(): ChemFlowSensor { return new ChemFlowSensor(this.data, 'flowSensor', this); }
     public get HMIAdvancedDisplay(): boolean { return this.data.HMIAdvancedDisplay; }
     public set HMIAdvancedDisplay(val: boolean) { this.setDataVal('HMIAdvancedDisplay', val); }
-    public get isAcidBaseDosing(): boolean { return this.data.isAcidBaseDosing; }
-    public set isAcidBaseDosing(val: boolean) { this.setDataVal('isAcidBaseDosing', val); }
-    public get ispHDoseByVolume(): boolean { return this.data.ispHDoseByVolume; }
-    public set ispHDoseByVolume(val: boolean) { this.setDataVal('ispHDoseByVolume', val); }
-    public get isorpDoseByVolume(): boolean { return this.data.isorpDoseByVolume; }
-    public set isorpDoseByVolume(val: boolean) { this.setDataVal('isorpDoseByVolume', val); }
-    public get pHManualDosing(): boolean { return this.data.pHManualDosing; }
-    public set pHManualDosing(val: boolean) { this.setDataVal('pHManualDosing', val); }
+    public get ph(): ChemicalPh { return new ChemicalPh(this.data, 'ph', this); }
+    public get orp(): ChemicalORP { return new ChemicalORP(this.data, 'orp', this); }
+    public get lsiRange(): AlarmSetting { return new AlarmSetting(this.data, 'lsiRange', this); }
     public getExtended() {
         let chem = this.get(true);
-        chem.type = sys.board.valueMaps.chemControllerTypes.transform(chem.type);
+        chem.type = sys.board.valueMaps.chemControllerTypes.transform(this.type);
+        chem.body = sys.board.valueMaps.bodies.transform(this.body);
+        chem.ph = this.ph.getExtended();
+        chem.orp = this.orp.getExtended();
+        chem.flowSensor = this.flowSensor.getExtended();
         return chem;
     }
+    // Chem controller alarms
+    // Controller
+    // 1. LSI Out of range.
+    //
+    // Chemical
+    // 1. Chemical out of range. -- Need to be able to set the range and the warning tolerance.
+    //    Probe: Probe not reporting
+    //    Tank: Tank Empty
+    //    Dosing: Max Dose limit
+    // ORP
+    // 1. Chlorinator Comms Lost.
+}
+export class ChemFlowSensor extends FlowSensor {
+    public dataName = 'flowSensorConfig';
+    public initData() {
+        super.initData();
+    }
+    public get minimumFlow(): number { return this.data.minimumFlow || 0; }
+    public set minimumFlow(val: number) { this.setDataVal('minimumFlow', val); }
+    public get minimumPressure(): number { return this.data.minimumPressure || 0; }
+    public set minimumPressure(val: number) { this.setDataVal('minimumPressure', val); }
+    public getExtended() {
+        let sensor = this.get(true);
+        sensor.type = sys.board.valueMaps.flowSensorTypes.transform(this.type);
+        return sensor;
+    }
+}
+export class Chemical extends ChildEqItem {
+    public dataName = 'chemicalConfig';
+    public initData() {
+        if (typeof this.data.pump === 'undefined') this.data.pump = {};
+        if (typeof this.data.tank === 'undefined') this.data.tank = {};
+        if (typeof this.data.enabled === 'undefined') this.data.enabled = true;
+        if (typeof this.data.dosingMethod === 'undefined') this.data.dosingMethod = 0;
+        if (typeof this.data.startDelay === 'undefined') this.data.startDelay = 1.5;
+        if (typeof this.data.flowReadingsOnly === 'undefined') this.data.flowReadingsOnly = true;
+        if (typeof this.data.flowOnlyMixing === 'undefined') this.data.flowOnlyMixing = true;
+        if (typeof this.data.maxDailyVolume === 'undefined') this.data.maxDailyVolume = 500;
+        super.initData();
+    }
+    public get chemType(): string { return this.data.chemType; }
+    public get enabled(): boolean { return utils.makeBool(this.data.enabled); }
+    public set enabled(val: boolean) { this.setDataVal('enabled', val); }
+    public get maxDosingTime(): number { return this.data.maxDosingTime; }
+    public set maxDosingTime(val: number) { this.setDataVal('maxDosingTime', val); }
+    public get maxDosingVolume(): number { return this.data.maxDosingVolume; }
+    public set maxDosingVolume(val: number) { this.setDataVal('maxDosingVolume', val); }
+    public get maxDailyVolume(): number { return this.data.maxDailyVolume; }
+    public set maxDailyVolume(val: number) { this.setDataVal('maxDailyVolume', val); }
+    
+    public get mixingTime(): number { return this.data.mixingTime; }
+    public set mixingTime(val: number) { this.setDataVal('mixingTime', val); }
+    public get flowOnlyMixing(): boolean { return utils.makeBool(this.data.flowOnlyMixing); }
+    public set flowOnlyMixing(val: boolean) { this.setDataVal('flowOnlyMixing', val); }
+    public get dosingMethod(): number | any { return this.data.dosingMethod; }
+    public set dosingMethod(val: number | any) { this.setDataVal('dosingMethod', sys.board.valueMaps.chemDosingMethods.encode(val)); }
+    public get startDelay(): number { return this.data.startDelay; }
+    public set startDelay(val: number) { this.setDataVal('startDelay', val); }
+    public get pump(): ChemicalPump { return new ChemicalPump(this.data, 'pump', this); }
+    public get tank(): ChemicalTank { return new ChemicalTank(this.data, 'tank', this); }
+    public get setpoint(): number { return this.data.setpoint; }
+    public set setpoint(val: number) { this.setDataVal('setpoint', val); }
+    public get tolerance(): AlarmSetting { return new AlarmSetting(this.data, 'tolerance', this); }
+    public getExtended() {
+        let chem = this.get(true);
+        chem.tank = this.tank.getExtended();
+        chem.pump = this.pump.getExtended();
+        chem.dosingMethod = sys.board.valueMaps.chemDosingMethods.transform(this.dosingMethod);
+        return chem;
+    }
+    public get flowReadingsOnly(): boolean { return utils.makeBool(this.data.flowReadingsOnly); }
+    public set flowReadingsOnly(val: boolean) { this.setDataVal('flowReadingsOnly', val); }
+}
+export class ChemicalPh extends Chemical {
+    public initData() {
+        this.data.chemType = 'ph';
+        if (typeof this.data.setpoint === 'undefined') this.data.setpoint = 7.2;
+        if (typeof this.data.phSupply === 'undefined') this.data.phSupply = 1;
+        if (typeof this.data.probe === 'undefined') this.data.probe = {};
+        if (typeof this.data.acidType === 'undefined') this.data.acidType = 0;
+        if (typeof this.data.tolerance === 'undefined') this.data.tolerance = { low: 7.2, high: 7.6, enabled: true };
+        if (typeof this.data.dosePriority === 'undefined') this.data.dosePriority = true;
+        super.initData();
+    }
+    public get phSupply(): number | any { return this.data.phSupply; }
+    public set phSupply(val: number | any) { this.setDataVal('phSupply', sys.board.valueMaps.phSupplyTypes.encode(val)); }
+    public get acidType(): number | any { return this.data.acidType; }
+    public set acidType(val: number | any) { this.setDataVal('acidType', sys.board.valueMaps.acidTypes.encode(val)); }
+    public get dosePriority(): boolean { return this.data.dosePriority; }
+    public set dosePriority(val: boolean) { this.setDataVal('dosePriority', val); }
+    public get probe(): ChemicalPhProbe { return new ChemicalPhProbe(this.data, 'probe', this); }
+    public getExtended() {
+        let chem = super.getExtended();
+        chem.probe = this.probe.getExtended();
+        chem.phSupply = sys.board.valueMaps.phSupplyTypes.transform(this.phSupply);
+        return chem;
+    }
+}
+export class ChemicalORP extends Chemical {
+    public initData() {
+        this.data.chemType = 'orp';
+        if (typeof this.data.setpoint === 'undefined') this.data.setpoint = 600;
+        if (typeof this.data.useChlorinator === 'undefined') this.data.useChlorinator = false;
+        if (typeof this.data.probe === 'undefined') this.data.probe = {};
+        if (typeof this.data.tolerance === 'undefined') this.data.tolerance = { low: 650, high: 800, enabled: true };
+        if (typeof this.data.phLockout === 'undefined') this.data.phLockout = 7.8;
+        super.initData();
+    }
+    public get useChlorinator(): boolean { return utils.makeBool(this.data.useChlorinator); }
+    public set useChlorinator(val: boolean) { this.setDataVal('useChlorinator', val); }
+    public get phLockout(): number { return this.data.phLockout; }
+    public set phLockout(val: number) { this.setDataVal('phLockout', val); }
+    public get probe(): ChemicalORPProbe { return new ChemicalORPProbe(this.data, 'probe', this); }
+    public getExtended() {
+        let chem = super.getExtended();
+        chem.probe = this.probe.getExtended();
+        return chem;
+    }
+}
+export class FilterCollection extends EqItemCollection<Filter> {
+    constructor(data: any, name?: string) { super(data, name || "filters"); }
+    public createItem(data: any): Filter { return new Filter(data); }
+}
+export class Filter extends EqItem {
+    public dataName='filterConfig';
+    public get id(): number { return this.data.id; }
+    public set id(val: number) { this.setDataVal('id', val); }
+    public get filterType(): number | any { return this.data.filterType; }
+    public set filterType(val: number | any) { this.setDataVal('filterType', sys.board.valueMaps.filterTypes.encode(val)); }
+    public get body(): number | any { return this.data.body; }
+    public set body(val: number | any) { this.setDataVal('body', sys.board.valueMaps.bodies.encode(val)); }
+    public get isActive(): boolean { return this.data.isActive; }
+    public set isActive(val: boolean) { this.setDataVal('isActive', val); }
+    public get name(): string { return this.data.name; }
+    public set name(val: string) { this.setDataVal('name', val); }
+    public get lastCleanDate(): Timestamp { return this.data.lastCleanDate; }
+    public set lastCleanDate(val: Timestamp) { this.setDataVal('lastCleanDate', val); }
+    public get needsCleaning(): number { return this.data.needsCleaning; }
+    public set needsCleaning(val: number) { this.setDataVal('needsCleaning', val); }
+}
+export class ChemicalProbe extends ChildEqItem {
+    public initData() {
+        if (typeof this.data.enabled === 'undefined') this.data.enabled = true;
+        super.initData();
+    }
+    public get enabled(): boolean { return utils.makeBool(this.data.enabled); }
+    public set enabled(val: boolean) { this.setDataVal('enabled', val); }
+    public get connectionId(): string { return this.data.connectionId; }
+    public set connectionId(val: string) { this.setDataVal('connectionId', val); }
+    public get deviceBinding(): string { return this.data.deviceBinding; }
+    public set deviceBinding(val: string) { this.setDataVal('deviceBinding', val); }
+    public getExtended() { return this.get(true); }
+}
+export class ChemicalPhProbe extends ChemicalProbe {
+    public get type(): number | any { return this.data.type; }
+    public set type(val: number | any) { this.setDataVal('type', sys.board.valueMaps.chemPhProbeTypes.encode(val)); }
+    public get feedBodyTemp(): boolean { return utils.makeBool(this.data.feedBodyTemp); }
+    public set feedBodyTemp(val: boolean) { this.setDataVal('feedBodyTemp', val); }
+}
+export class ChemicalORPProbe extends ChemicalProbe {
+    public get type(): number | any { return this.data.type; }
+    public set type(val: number | any) { this.setDataVal('type', sys.board.valueMaps.chemORPProbeTypes.encode(val)); }
+}
+
+export class ChemicalPump extends ChildEqItem {
+    public dataName = 'chemicalPumpConfig';
+    public initData() {
+        if (typeof this.data.type === 'undefined') this.data.type = 0;
+        if (typeof this.data.ratedFlow === 'undefined') this.data.ratedFlow = 0;
+        if (typeof this.data.enabled === 'undefined') this.data.enabled = true;
+        super.initData();
+    }
+    public get enabled(): boolean { return utils.makeBool(this.data.enabled); }
+    public set enabled(val: boolean) { this.setDataVal('enabled', val); }
+    public get connectionId(): string { return this.data.connectionId; }
+    public set connectionId(val: string) { this.setDataVal('connectionId', val); }
+    public get deviceBinding(): string { return this.data.deviceBinding; }
+    public set deviceBinding(val: string) { this.setDataVal('deviceBinding', val); }
+    public get type(): number | any { return this.data.type; }
+    public set type(val: number | any) { this.setDataVal('type', sys.board.valueMaps.chemPumpTypes.encode(val)); }
+    public get ratedFlow(): number { return this.data.ratedFlow || 0; }
+    public set ratedFlow(val: number) { this.setDataVal('ratedFlow', val); }
+    public getExtended() {
+        let pump = this.get(true);
+        pump.type = sys.board.valueMaps.chemPumpTypes.transform(this.type);
+        return pump;
+    }
+}
+export class ChemicalTank extends ChildEqItem {
+    public dataName = 'chemicalTankConfig';
+    public initData() {
+        if (typeof this.data.capacity === 'undefined') this.data.capacity = 0;
+        if (typeof this.data.units === 'undefined') this.data.units = 0;
+        if (typeof this.data.alarmEmptyEnabled === 'undefined') this.data.alarmEmptyEnabled = true;
+        if (typeof this.data.alarmEmptyLevel === 'undefined') this.data.alarmEmptyLevel = 20;
+        super.initData();
+    }
+    public get capacity(): number { return this.data.capacity; }
+    public set capacity(val: number) { this.setDataVal('capacity', val); }
+    public get alarmEmptyEnabled(): boolean { return this.data.alarmEmptyEnabled; }
+    public set alarmEmptyEnabled(val: boolean) { this.setDataVal('alarmEmptyEnabled', val); }
+    public get alarmEmptyLevel(): number { return this.data.alarmEmptyLevel; }
+    public set alarmEmptyLevel(val: number) { this.setDataVal('alarmEmptyLevel', val); }
+    public get units(): number | any { return this.data.units; }
+    public set units(val: number | any) { this.setDataVal('units', sys.board.valueMaps.volumeUnits.encode(val)); }
+    public getExtended() {
+        let tank = this.get(true);
+        tank.units = sys.board.valueMaps.volumeUnits.transform(this.units);
+        return tank;
+    }
+}
+export class AlarmSetting extends ChildEqItem {
+    public dataName = 'AlarmSettingConfig';
+    public initData() {
+        if (typeof this.data.low === 'undefined') this.data.low = 0;
+        if (typeof this.data.high === 'undefined') this.data.high = 0;
+    }
+    public get enabled(): boolean { return utils.makeBool(this.data.enabled); }
+    public set enabled(val: boolean) { this.setDataVal('enabled', val); }
+    public get low(): number { return this.data.low; }
+    public set low(val: number) { this.setDataVal('low', val); }
+    public get high(): number { return this.data.high; }
+    public set high(val: number) { this.setDataVal('high', val); }
 }
 export let sys = new PoolSystem();

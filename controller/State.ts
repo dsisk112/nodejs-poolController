@@ -22,7 +22,7 @@ import * as util from 'util';
 import { logger } from '../logger/Logger';
 import { webApp } from '../web/Server';
 import { ControllerType, Timestamp, utils, Heliotrope } from './Constants';
-import { sys } from './Equipment';
+import { sys, Chemical } from './Equipment';
 import { versionCheck } from '../config/VersionCheck';
 
 export class State implements IState {
@@ -103,6 +103,7 @@ export class State implements IState {
             _state.lightGroups = this.lightGroups.getExtended();
             _state.virtualCircuits = this.virtualCircuits.getExtended();
             _state.covers = this.covers.getExtended();
+            _state.filters = this.filters.getExtended();
             _state.schedules = this.schedules.getExtended();
             _state.chemControllers = this.chemControllers.getExtended();
             return _state;
@@ -122,20 +123,22 @@ export class State implements IState {
         }
     }
     public async stopAsync() {
-        if (this._timerDirty) clearTimeout(this._timerDirty);
-        this.persist();
-        if (sys.controllerType === ControllerType.Virtual) {
-            for (let i = 0; i < state.temps.bodies.length; i++) {
-                state.temps.bodies.getItemByIndex(i).isOn = false;
+        try {
+            if (this._timerDirty) clearTimeout(this._timerDirty);
+            this.persist();
+            if (sys.controllerType === ControllerType.Virtual) {
+                for (let i = 0; i < state.temps.bodies.length; i++) {
+                    state.temps.bodies.getItemByIndex(i).isOn = false;
+                }
+                for (let i = 0; i < state.circuits.length; i++) {
+                    state.circuits.getItemByIndex(i).isOn = false;
+                }
+                for (let i = 0; i < state.features.length; i++) {
+                    state.features.getItemByIndex(i).isOn = false;
+                }
             }
-            for (let i = 0; i < state.circuits.length; i++) {
-                state.circuits.getItemByIndex(i).isOn = false;
-            }
-            for (let i = 0; i < state.features.length; i++) {
-                state.features.getItemByIndex(i).isOn = false;
-            }
-        }
-        return Promise.resolve();
+            logger.info('State process shut down');
+        } catch (err) { logger.error(`Error shutting down state process: ${err.message}`); }
     }
     private _emitTimerDirty: NodeJS.Timeout;
     private _hasChanged = false;
@@ -213,6 +216,9 @@ export class State implements IState {
         }
         for (let i = 0; i < state.covers.length; i++) {
             state.covers.getItemByIndex(i).hasChanged = true;
+        }
+        for (let i = 0; i < state.filters.length; i++) {
+            state.filters.getItemByIndex(i).hasChanged = true;
         }
         for (let i = 0; i < state.schedules.length; i++) {
             state.schedules.getItemByIndex(i).hasChanged = true;
@@ -337,6 +343,7 @@ export class State implements IState {
         this.virtualCircuits = new VirtualCircuitStateCollection(this.data, 'virtualCircuits');
         this.chemControllers = new ChemControllerStateCollection(this.data, 'chemControllers');
         this.covers = new CoverStateCollection(this.data, 'covers');
+        this.filters = new FilterStateCollection(this.data, 'filters');
         this.comms = new CommsState();
         this.heliotrope = new Heliotrope();
         this.appVersion = new AppVersionState(this.data, 'appVersion');
@@ -356,7 +363,7 @@ export class State implements IState {
         this.schedules.clear();
         this.valves.clear();
         this.virtualCircuits.clear();
-        this.covers.clear();
+        this.filters.clear();
         this.chemControllers.clear();
     }
 
@@ -373,6 +380,7 @@ export class State implements IState {
     public lightGroups: LightGroupStateCollection;
     public virtualCircuits: VirtualCircuitStateCollection;
     public covers: CoverStateCollection;
+    public filters: FilterStateCollection;
     public chemControllers: ChemControllerStateCollection;
     public comms: CommsState;
     public appVersion: AppVersionState;
@@ -405,6 +413,7 @@ interface IState {
     circuitGroups: CircuitGroupStateCollection;
     virtualCircuits: VirtualCircuitStateCollection;
     chemControllers: ChemControllerStateCollection;
+    filters: FilterStateCollection;
     comms: CommsState;
 }
 export interface ICircuitState {
@@ -419,11 +428,11 @@ export interface ICircuitState {
     showInFeatures?: boolean;
 }
 
-interface IEqStateCreator<T> { ctor(data: any, name: string): T; }
+interface IEqStateCreator<T> { ctor(data: any, name: string, parent?): T; }
 class EqState implements IEqStateCreator<EqState> {
     public dataName: string;
     public data: any;
-    private _hasChanged: boolean = false;
+    protected _hasChanged: boolean = false;
     public get hasChanged(): boolean { return this._hasChanged; }
     public set hasChanged(val: boolean) {
         // If we are not already on the dirty list add us.        
@@ -438,17 +447,22 @@ class EqState implements IEqStateCreator<EqState> {
             if (typeof (data[name]) === 'undefined') data[name] = {};
             this.data = data[name];
             this.dataName = name;
+            this.initData();
         }
-        else
+        else {
             this.data = data;
+            this.initData();
+        }
     }
+    public initData() { }
     public emitEquipmentChange() {
         if (typeof (webApp) !== 'undefined' && webApp) {
-            if (this.hasChanged) this.emitData(this.dataName, this.data);
+            if (this.hasChanged) this.emitData(this.dataName, this.getEmitData());
             this.hasChanged = false;
             state._dirtyList.removeEqState(this);
         }
     }
+    public getEmitData() { return this.data; }
     public emitData(name: string, data: any) { webApp.emitToClients(name, data); }
     protected setDataVal(name, val, persist?: boolean): any {
         if (this.data[name] !== val) {
@@ -484,6 +498,25 @@ class EqState implements IEqStateCreator<EqState> {
     }
     public getExtended(): any { return this.get(true); }
 }
+class ChildEqState extends EqState implements IEqStateCreator<EqState> {
+    private _pmap = new WeakSet();
+    //private _dataKey = { id: 'parent' };
+    constructor(data: any, name: string, parent) {
+        super(data, name);
+        this._pmap['parent'] = parent;
+    }
+    public get hasChanged(): boolean { return this._hasChanged; }
+    public set hasChanged(val: boolean) {
+        // Bubble up to the parent state.
+        if (val) {
+            let parent = this.getParent();
+            if (typeof parent !== 'undefined' && typeof parent['hasChanged'] !== 'undefined') {
+                parent.hasChanged = true;
+            }
+        }
+    }
+    public getParent() { return typeof this._pmap !== 'undefined' ? this._pmap['parent'] : undefined; }
+}
 class EqStateCollection<T> {
     protected data: any;
     constructor(data: [], name: string) {
@@ -504,7 +537,7 @@ class EqStateCollection<T> {
     }
     public removeItemById(id: number): T {
         let rem: T = null;
-        for (let i = 0; i < this.data.length; i++) {
+        for (let i = this.data.length - 1; i >= 0; i--) {
             if (typeof (this.data[i].id) !== 'undefined' && this.data[i].id === id) {
                 rem = this.data.splice(i, 1);
             }
@@ -526,7 +559,7 @@ class EqStateCollection<T> {
         });
     }
     public sort(fn: (a, b) => number) { this.data.sort(fn); }
-    public get(bCopy?: boolean) { return typeof bCopy === 'undefined' || !bCopy ? this.data : extend(true, {}, this.data); }
+    public get(bCopy?: boolean) { return typeof bCopy === 'undefined' || !bCopy ? this.data : JSON.parse(JSON.stringify(this.data)) };// extend(true, {}, this.data); }
     public getExtended(): any {
         let arr = [];
         for (let i = 0; i < this.length; i++) {
@@ -540,6 +573,10 @@ class EqStateCollection<T> {
     public find(f: (value: any, index?: number, obj?: any) => boolean): T {
         let itm = this.data.find(f);
         if (typeof itm !== 'undefined') return this.createItem(itm);
+    }
+    public exists(f: (value: any, index?: number, obj?: any) => boolean): boolean {
+        let itm = this.find(f);
+        return typeof itm === 'object';
     }
     public toArray() {
         let arr = [];
@@ -613,7 +650,6 @@ export class EquipmentState extends EqState {
     public get maxLightGroups(): number { return this.data.maxLightGroups; }
     public set maxLightGroups(val: number) { this.setDataVal('maxLightGroups', val); }
     // This could be extended to include all the expansion panels but not sure why.
-    public cancelDelay() { sys.board.system.cancelDelay(); }
     public getExtended() {
         let obj = this.get(true);
         obj.softwareVersion = sys.equipment.controllerFirmware || "";
@@ -655,6 +691,8 @@ export class PumpState extends EqState {
     public set driveState(val: number) { this.setDataVal('driveState', val); }
     public get command(): number { return this.data.command; }
     public set command(val: number) { this.setDataVal('command', val); }
+    public get isActive(): boolean { return this.data.isActive; }
+    public set isActive(val: boolean) { this.setDataVal('isActive', val); }
     public get ppc(): number { return this.data.ppc; } // I think this is actually the filter % for vf and vsf.  Pump Pressure determines how much backpressure.
     public set ppc(val: number) { this.setDataVal('ppc', val); }
     public get status(): number { return typeof (this.data.status) !== 'undefined' ? this.data.status.val : -1; }
@@ -731,11 +769,14 @@ export class ScheduleStateCollection extends EqStateCollection<ScheduleState> {
     public createItem(data: any): ScheduleState { return new ScheduleState(data); }
 }
 export class ScheduleState extends EqState {
-    constructor(data: any, dataName?: string) {
-        super(data, dataName);
-        if (typeof (data.startDate) === 'undefined') this._startDate = new Date();
-        else this._startDate = new Date(data.startDate);
+    constructor(data: any, dataName?: string) { super(data, dataName); }
+    public initData() {
+        if (typeof this.data.startDate === 'undefined') this._startDate = new Date();
+        else this._startDate = new Date(this.data.startDate);
         if (isNaN(this._startDate.getTime())) this._startDate = new Date();
+        if (typeof this.data.startTimeType === 'undefined') this.data.startTimeType = 0;
+        if (typeof this.data.endTimeType === 'undefined') this.data.endTimeType = 0;
+        if (typeof this.data.display === 'undefined') this.display = 0;
     }
     private _startDate: Date = new Date();
     public get startDate(): Date { return this._startDate; }
@@ -790,6 +831,16 @@ export class ScheduleState extends EqState {
             this.hasChanged = true;
         }
     }
+    public get display(): number { return typeof (this.data.display) !== 'undefined' ? this.data.display.val : undefined; }
+    public set display(val: number) {
+        if (this.display !== val) {
+            this.data.display = sys.board.valueMaps.scheduleDisplayTypes.transform(val);
+            this.hasChanged = true;
+        }
+    }
+
+    public get changeHeatSetpoint(): boolean { return this.data.changeHeatSetpoint; }
+    public set changeHeatSetpoint(val: boolean) { this.setDataVal('changeHeatSetpoint', val); }
     public get heatSetpoint(): number { return this.data.heatSetpoint; }
     public set heatSetpoint(val: number) { this.setDataVal('heatSetpoint', val); }
     public get isOn(): boolean { return this.data.isOn; }
@@ -820,6 +871,7 @@ export interface ICircuitGroupState {
     isActive: boolean;
     dataName: string;
     lightingTheme?: number;
+    showInFeatures?: boolean;
     get(bCopy?: boolean);
     emitEquipmentChange();
 }
@@ -852,8 +904,11 @@ export class CircuitGroupState extends EqState implements ICircuitGroupState, IC
     public set isOn(val: boolean) { this.setDataVal('isOn', val); }
     public get isActive(): boolean { return this.data.isActive; }
     public set isActive(val: boolean) { this.setDataVal('isActive', val); }
+    public get showInFeatures(): boolean { return typeof this.data.showInFeatures === 'undefined' ? true : this.data.showInFeatures; }
+    public set showInFeatures(val: boolean) { this.setDataVal('showInFeatures', val); }
     public getExtended() {
         let sgrp = this.get(true); // Always operate on a copy.
+        if (typeof sgrp.showInFeatures === 'undefined') sgrp.showInFeatures = true;
         let cgrp = sys.circuitGroups.getItemById(this.id);
         sgrp.circuits = [];
         for (let i = 0; i < cgrp.circuits.length; i++) {
@@ -951,6 +1006,9 @@ export class BodyHeaterTypeState extends EqState {
 }
 export class BodyTempState extends EqState {
     public dataName = 'bodyTempState';
+    public initData() {
+        if (typeof this.data.heaterOptions === 'undefined') this.data.heaterOptions = { total: 0 };
+    }
     public get id(): number { return this.data.id; }
     public set id(val: number) { this.setDataVal('id', val); }
     public get circuit(): number { return this.data.circuit; }
@@ -959,7 +1017,7 @@ export class BodyTempState extends EqState {
     public set name(val: string) { this.setDataVal('name', val); }
     public get temp(): number { return this.data.temp; }
     public set temp(val: number) { this.setDataVal('temp', val); }
-    public get type():number { return typeof (this.data.type) !== 'undefined' ? this.data.type.val : -1; }
+    public get type(): number { return typeof (this.data.type) !== 'undefined' ? this.data.type.val : -1; }
     public set type(val: number) {
         if (this.type !== val) {
             this.data.type = sys.board.valueMaps.bodyTypes.transform(val);
@@ -989,7 +1047,7 @@ export class BodyTempState extends EqState {
     // here as the heater types are specific to the installed equipment.  The reason is because it has no meaning without the body and the calculation of it should
     // be performed when the body or heater options change.  However, it shouldn't emit unless
     // there truly is a change but the emit needs to occur at the body temp state level.
-    public get heaterOptions(): any { return typeof this.data.heaterOptions === 'undefined' ? this.setDataVal('heaterOptions', {}) : this.data.heaterOptions; }
+    public get heaterOptions(): any { return typeof this.data.heaterOptions === 'undefined' ? this.setDataVal('heaterOptions', { total: 0 }) : this.data.heaterOptions; }
     public set heaterOptions(val: any) {
         // We are doing this simply to maintain the proper automatic emits. We don't want the emit to happen unnecessarily so lets
         // get creative on the object and dirty up the body only when needed.
@@ -1209,6 +1267,9 @@ export class ChlorinatorStateCollection extends EqStateCollection<ChlorinatorSta
     public lastDispatchSuperChlor: number = 0;
 }
 export class ChlorinatorState extends EqState {
+    public initData() {
+        if (typeof this.data.disabled === 'undefined') this.data.disabled = false;
+    }
     public dataName: string = 'chlorinator';
     // The lastComm property has a fundamental flaw.  Although, the structure is
     // not dirtied where the emitter sends out a message on each lastComm, the persistence proxy is
@@ -1218,6 +1279,8 @@ export class ChlorinatorState extends EqState {
     public set lastComm(val: number) { this.setDataVal('lastComm', val, false); }
     public get id(): number { return this.data.id; }
     public set id(val: number) { this.data.id = val; }
+    public get isActive(): boolean { return this.data.isActive; }
+    public set isActive(val: boolean) { this.setDataVal('isActive', val); }
     public get name(): string { return this.data.name; }
     public set name(val: string) { this.setDataVal('name', val); }
     public get currentOutput(): number { return this.data.currentOutput || 0; }
@@ -1248,6 +1311,7 @@ export class ChlorinatorState extends EqState {
         if (this.virtualControllerStatus !== val) {
             this.data.virtualControllerStatus = sys.board.valueMaps.virtualControllerStatus.transform(val);
             this.hasChanged = true;
+
         }
     }
     public get type(): number { return typeof (this.data.type) !== 'undefined' ? this.data.type.val : -1; }
@@ -1273,7 +1337,8 @@ export class ChlorinatorState extends EqState {
     public get saltRequired(): number { return this.data.saltRequired; }
     public get saltLevel(): number { return this.data.saltLevel; }
     public set saltLevel(val: number) {
-        this.data.saltLevel = val;
+        this.setDataVal('saltLevel', val);
+        //this.data.saltLevel = val;
         // Calculate the salt required.
         let capacity = 0;
         for (let i = 0; i < sys.bodies.length; i++) {
@@ -1303,14 +1368,27 @@ export class ChlorinatorState extends EqState {
     }
     public get superChlorRemaining(): number { return this.data.superChlorRemaining || 0; }
     public set superChlorRemaining(val: number) {
-        // Trim the seconds off both of these as we will be keeping the seconds separately since this
-        // only reports in minutes.  That way our seconds become self healing.
-        if (Math.ceil(this.superChlorRemaining / 60) * 60 !== val) {
-            state.chlorinators.superChlorReference = Math.floor(new Date().getTime() / 1000); // Get the epoc and strip the milliseconds.
-            this.hasChanged = true;
+        let remaining: number;
+        if (sys.controllerType === 'intellicenter') {
+            // Trim the seconds off both of these as we will be keeping the seconds separately since this
+            // only reports in minutes.  That way our seconds become self healing.
+            if (Math.ceil(this.superChlorRemaining / 60) * 60 !== val) {
+                state.chlorinators.superChlorReference = Math.floor(new Date().getTime() / 1000); // Get the epoc and strip the milliseconds.
+                this.hasChanged = true;
+            }
+            let secs = Math.floor(new Date().getTime() / 1000) - state.chlorinators.superChlorReference;
+            remaining = Math.max(0, val - Math.min(secs, 60));
         }
-        let secs = Math.floor(new Date().getTime() / 1000) - state.chlorinators.superChlorReference;
-        let remaining = Math.max(0, val - Math.min(secs, 60));
+        else {
+            // *Touch only reports superchlor hours remaining. 
+            // If we have the same hours as existing, retain the mins + secs
+            if (Math.ceil(this.superChlorRemaining / 3600) * 60 !== val / 60) {
+                state.chlorinators.superChlorReference = Math.floor(new Date().getTime() / 1000); // Get the epoc and strip the milliseconds.
+                this.hasChanged = true;
+            }
+            let secs = Math.floor(new Date().getTime() / 1000) - state.chlorinators.superChlorReference;
+            remaining = Math.max(0, val - Math.min(secs, 3600));
+        }
         if (state.chlorinators.lastDispatchSuperChlor - 5 > remaining) this.hasChanged = true;
         if (this.hasChanged) state.chlorinators.lastDispatchSuperChlor = remaining;
         this.data.superChlorRemaining = remaining;
@@ -1325,15 +1403,99 @@ export class ChemControllerStateCollection extends EqStateCollection<ChemControl
 }
 
 export class ChemControllerState extends EqState {
+    public initData() {
+        if (typeof this.data.flowDetected === 'undefined') this.data.flowDetected = false;
+        if (typeof this.data.orp === 'undefined') this.data.orp = {};
+        if (typeof this.data.ph === 'undefined') this.data.ph = {};
+        if (typeof this.data.flowSensor === 'undefined') this.data.flowSensor = {};
+        if (typeof this.data.type === 'undefined') { this.type = 1; }
+        else if (typeof this.data.type.ph === 'undefined') {
+            this.data.type = sys.board.valueMaps.chemControllerTypes.transform(this.type);
+        }
+        //var chemControllerState = {
+        //    lastComm: 'number',             // The unix time the chem controller sent its status.
+        //    id: 'number',                   // Id of the chemController.
+        //    type: 'valueMap',               // intellichem, homegrown, rem.
+        //    address: 'number',              // Assigned address if IntelliChem.
+        //    name: 'string',                 // Name assigned to the controller.
+        //    status: 'valueMap',             // ok, nocomms, setupError
+        //    body: 'valueMap',               // Body that the chemController is assigned to.
+        //    flowDetected: 'boolean',        // True if there is currently sufficient flow to read and dose.
+        //    flowDelay: 'boolean',           // True of the controller is currently under a flow delay.
+        //    firmware: 'string',             // Firmware version from IntelliChem (this should be in config)
+        //    saturationIndex: 'number',      // Calculated LSI for the body.
+        //    isActive: 'boolean',    
+        //    alarms: {},                     // This has not changed although additional alarms will be added.
+        //    warnings: {},                   // This has not changed although additional warnings will be added.
+        //    chemistryStatus: 'valueMap',    // Current water quality status.
+        //    ph: {
+        //        chemType: 'string',                 // Constant ph.
+        //        dosingTimeRemaining: 'number',      // The number of seconds remaining for the current dose.
+        //        dosingVolumeRemaining: 'number',    // Remaining volume for the current dose in mL.
+        //        mixTimeRemaining: 'number',         // The number of seconds remaining in the current mix cycle.
+        //        dosingStatus: 'valueMap',           // dosing, monitoring, mixing.
+        //        level: 'number',                    // The current pH level.
+        //        lockout: 'boolean',                 // True if an attempt to dose was thwarted by error.
+        //        manualDosing: 'boolean',            // True if the pump is running outside of a dosing command.
+        //        dailyLimitReached: 'boolean',       // True if the calculated daily limit has been reached based upon body volume.
+        //        pump: {
+        //            type: 'valueMap',               // The defined pump type.
+        //            isDosing: 'boolean',            // True if the pump is running.
+        //        },
+        //        tank: {
+        //            level: 'number',                // The current level for the tank.
+        //            capacity: 'number',             // Total capacity for the tank.
+        //            units: 'valueMap',              // nounits, gal, mL, cL, L, oz, pt, qt.
+        //        },
+        //        probe: {
+        //            level: 'number',                // Current ph level as measured by the probe.
+        //            temperature: 'number',          // The temperature used to calculate the adjusted probe level.
+        //            tempUnits: 'valueMap'           // Units for the temperature C or F.
+        //        }
+        //    },
+        //    orp: {
+        //        chemType: 'string',                 // Constant orp.
+        //        dosingTimeRemaining: 'number',      // The number of seconds remaining for the current dose.
+        //        dosingVolumeRemaining: 'number',    // Remaining volume for the current dose in mL.
+        //        mixTimeRemaining: 'number',         // The number of seconds remaining in the current mix cycle.
+        //        dosingStatus: 'valueMap',           // dosing, monitoring, mixing.
+        //        level: 'number',                    // The current ORP level.
+        //        lockout: 'boolean',                 // True if an attempt to dose was thwarted by error.
+        //        manualDosing: 'boolean',            // True if the pump is running outside of a dosing command.
+        //        dailyLimitReached: 'boolean',       // True if the calculated daily limit has been reached based upon body volume.
+        //        pump: {
+        //            type: 'valueMap',               // The defined pump type.
+        //            isDosing: 'boolean',            // True if the pump is running.
+        //        },
+        //        tank: {
+        //            level: 'number',                // The current level for the tank.
+        //            capacity: 'number',             // Total capacity for the tank.
+        //            units: 'valueMap',              // nounits, gal, mL, cL, L, oz, pt, qt.
+        //        },
+        //        probe: {
+        //            level: 'number',                // Current ORP level as measured by the probe.
+        //            temperature: 'number',          // The temperature used to calculate the adjusted probe level.
+        //            tempUnits: 'valueMap'           // Units for the temperature C or F.
+        //        }
+        //    }
+        //}
+
+    }
     public dataName: string = 'chemController';
     public get lastComm(): number { return this.data.lastComm || 0; }
     public set lastComm(val: number) { this.setDataVal('lastComm', val, false); }
     public get id(): number { return this.data.id; }
     public set id(val: number) { this.setDataVal('id', val); }
+    public get isActive(): boolean { return this.data.isActive; }
+    public set isActive(val: boolean) { this.setDataVal('isActive', val); }
     public get name(): string { return this.data.name; }
     public set name(val: string) { this.setDataVal('name', val); }
     public get address(): number { return this.data.address; }
     public set address(val: number) { this.setDataVal('address', val); }
+    public get isBodyOn(): boolean { return this.data.isBodyOn; }
+    public set isBodyOn(val: boolean) { this.data.isBodyOn = val; }
+    public get flowDetected(): boolean { return this.data.flowDetected; }
+    public set flowDetected(val: boolean) { this.data.flowDetected = val; }
     public get status(): number {
         return typeof (this.data.status) !== 'undefined' ? this.data.status.val : -1;
     }
@@ -1357,93 +1519,15 @@ export class ChemControllerState extends EqState {
             this.hasChanged = true;
         }
     }
-
-    public get pHLevel(): number { return this.data.pHLevel; }
-    public set pHLevel(val: number) { this.setDataVal('pHLevel', val); }
-    public get orpLevel(): number { return this.data.orpLevel; }
-    public set orpLevel(val: number) { this.setDataVal('orpLevel', val); }
-    public get saltLevel(): number { return this.data.saltLevel; }
-    public set saltLevel(val: number) { this.setDataVal('saltLevel', val); }
-    /*     public get waterFlow(): number { return this.data.waterFlow; }
-        public set waterFlow(val: number) {
-            if (this.waterFlow !== val) {
-                this.data.waterFlow = sys.board.valueMaps.chemControllerWaterFlow.transform(val);
-                this.hasChanged = true;
-            }
-        } */
-    public get acidTankLevel(): number { return this.data.acidTankLevel; }
-    public set acidTankLevel(val: number) { this.setDataVal('acidTankLevel', val); }
-    public get orpTankLevel(): number { return this.data.orpTankLevel; }
-    public set orpTankLevel(val: number) { this.setDataVal('orpTankLevel', val); }
-    /* public get status1(): number { return this.data.status1; }
-    public set status1(val: number) {
-        if (this.status1 !== val) {
-            this.data.status1 = sys.board.valueMaps.intelliChemStatus1.transform(val);
-            this.hasChanged = true;
-        }
-    } */
-    /*     public get status2(): number { return this.data.status2; }
-        public set status2(val: number) {
-            if (this.status2 !== val) {
-                this.data.status2 = sys.board.valueMaps.intelliChemStatus2.transform(val);
-                this.hasChanged = true;
-            }
-        } */
-    /*     public get alarms(): number { return typeof (this.data.alarms) !== 'undefined' ? this.data.alarms.val : undefined; }
-        public set alarms(val: number) {
-            if (this.alarms !== val) {
-                this.data.alarms = sys.board.valueMaps.chemControllerAlarms.transform(val);
-                this.hasChanged = true;
-            }
-        } */
-    public get pHDosingStatus(): number { return typeof (this.data.pHDosingStatus) !== 'undefined' ? this.data.pHDosingStatus.val : undefined; }
-    public set pHDosingStatus(val: number) {
-        if (this.pHDosingStatus !== val) {
-            this.data.pHDosingStatus = sys.board.valueMaps.chemControllerDosingStatus.transform(val);
-            this.hasChanged = true;
-        }
-    }
-    public get orpDosingStatus(): number { return typeof (this.data.orpDosingStatus) !== 'undefined' ? this.data.orpDosingStatus.val : undefined; }
-    public set orpDosingStatus(val: number) {
-        if (this.orpDosingStatus !== val) {
-            this.data.orpDosingStatus = sys.board.valueMaps.chemControllerDosingStatus.transform(val);
-            this.hasChanged = true;
-        }
-    }
-    /*     public get warnings(): number { return typeof (this.data.warnings) !== 'undefined' ? this.data.warnings.val : undefined; }
-        public set warnings(val: number) {
-            if (this.dosingStatus !== val) {
-                this.data.dosingStatus = sys.board.valueMaps.chemControllerWarnings.transform(val);
-                this.hasChanged = true;
-            }
-        } */
-    public get warnings(): ChemControllerStateWarnings { return new ChemControllerStateWarnings(this.data, 'warnings'); }
-    public get alarms(): ChemControllerStateAlarms { return new ChemControllerStateAlarms(this.data, 'alarms'); }
-    public get pHDosingTime(): number { return this.data.pHDosingTime; }
-    public set pHDosingTime(val: number) { this.setDataVal('pHDosingTime', val); }
-    public get orpDosingTime(): number { return this.data.orpDosingTime; }
-    public set orpDosingTime(val: number) { this.setDataVal('orpDosingTime', val); }
-    public get pHDosingVolume(): number { return this.data.pHDosingVolume; }
-    public set pHDosingVolume(val: number) { this.setDataVal('pHDosingVolume', val); }
-    public get orpDosingVolume(): number { return this.data.orpDosingVolume; }
-    public set orpDosingVolume(val: number) { this.setDataVal('orpDosingVolume', val); }
     public get saturationIndex(): number { return this.data.saturationIndex; }
-    public set saturationIndex(val: number) { this.setDataVal('saturationIndex', val); }
-    public get temp(): number { return this.data.temp; }
-    public set temp(val: number) { this.setDataVal('temp', val); }
+    public set saturationIndex(val: number) { this.setDataVal('saturationIndex', val || 0); }
     public get firmware(): string { return this.data.firmware; }
     public set firmware(val: string) { this.setDataVal('firmware', val); }
-    public get tempUnits(): number {
-        if (typeof this.data.tempUnits !== 'undefined') return this.data.tempUnits.val;
-        else return state.temps.units;
-    }
-    public set tempUnits(val: number) {
-        // specific check for the data val here because we can return the body temp units if undefined
-        if (this.data.tempUnits !== val) {
-            this.data.tempUnits = sys.board.valueMaps.tempUnits.transform(val);
-            this.hasChanged = true;
-        }
-    }
+    public get ph(): ChemicalPhState { return new ChemicalPhState(this.data, 'ph', this); }
+    public get orp(): ChemicalORPState { return new ChemicalORPState(this.data, 'orp', this); }
+    public get flowSensor(): ChemicalFlowSensorState { return new ChemicalFlowSensorState(this.data, 'flowSensor', this); }
+    public get warnings(): ChemControllerStateWarnings { return new ChemControllerStateWarnings(this.data, 'warnings', this); }
+    public get alarms(): ChemControllerStateAlarms { return new ChemControllerStateAlarms(this.data, 'alarms', this); }
     public get virtualControllerStatus(): number {
         return typeof (this.data.virtualControllerStatus) !== 'undefined' ? this.data.virtualControllerStatus.val : -1;
     }
@@ -1459,22 +1543,220 @@ export class ChemControllerState extends EqState {
         obj.address = chem.address;
         obj.saturationIndex = this.saturationIndex || 0;
         obj.alkalinity = chem.alkalinity;
-        obj.body = sys.board.valueMaps.bodies.transform(chem.body);
         obj.calciumHardness = chem.calciumHardness;
         obj.cyanuricAcid = chem.cyanuricAcid;
-        obj.orpSetpoint = chem.orpSetpoint;
-        obj.pHSetpoint = chem.pHSetpoint;
-        obj.type = sys.board.valueMaps.chemControllerTypes.transform(chem.type);
-        obj.orpTankLevel = this.orpTankLevel || 0;
-        obj.acidTankLevel = this.acidTankLevel || 0;
-        obj.pHLevel = this.pHLevel || 0;
-        obj.orpLevel = this.orpLevel || 0;
+        obj.ph = this.ph.getExtended();
+        obj.orp = this.orp.getExtended();
+        obj = extend(true, obj, chem.getExtended());
         return obj;
     }
 }
+export class ChemicalState extends ChildEqState {
+    public initData() {
+        if (typeof this.data.tank == 'undefined') this.data.tank = { capacity: 0, level: 0, units: 0 };
+        if (typeof this.data.dosingTimeRemaining === 'undefined') this.data.dosingTimeRemaining = 0;
+        if (typeof this.data.delayTimeRemaining === 'undefined') this.data.delayTimeRemaining = 0;
+        if (typeof this.data.dosingVolumeRemaining === 'undefined') this.data.dosingVolumeRemaining = 0;
+        if (typeof this.data.doseVolume === 'undefined') this.data.doseVolume = 0;
+        if (typeof this.data.doseTime === 'undefined') this.data.doseTime = 0;
+        if (typeof this.data.lockout === 'undefined') this.data.lockout = false;
+        if (typeof this.data.level == 'undefined') this.data.level = 0;
+        if (typeof this.data.mixTimeRemaining === 'undefined') this.data.mixTimeRemaining = 0;
+        if (typeof this.data.dailyLimitReached === 'undefined') this.data.dailyLimitReached = false;
+        if (typeof this.data.manualDosing === 'undefined') this.data.manualDosing = false;
+        if (typeof this.data.flowDelay === 'undefined') this.data.flowDelay = false;
+        if (typeof this.data.dosingStatus === 'undefined') this.dosingStatus = 1;
+        if (typeof this.data.enabled === 'undefined') this.data.enabled = true;
+        if (typeof this.data.level === 'undefined') this.data.level = 0;
+    }
+    public get enabled(): boolean { return this.data.enabled; }
+    public set enabled(val: boolean) { this.data.enabled = val; }
+    public get level(): number { return this.data.level; }
+    public set level(val: number) { this.setDataVal('level', val); }
+    public get setpoint(): number { return this.data.setpoint; }
+    public set setpoint(val: number) { this.setDataVal('setpoint', val); }
+    public get chemController(): ChemControllerState { return this.getParent() as ChemControllerState; }
+    public get chemType(): string { return this.data.chemType; }
+    public get delayTimeRemaining(): number { return this.data.delayTimeRemaining; }
+    public set delayTimeRemaining(val: number) { this.setDataVal('delayTimeRemaining', val); }
+    public get doseTime(): number { return this.data.doseTime; }
+    public set doseTime(val: number) { this.setDataVal('doseTime', val); }
+    public get doseVolume(): number { return this.data.doseVolume; }
+    public set doseVolume(val: number) { this.setDataVal('doseVolume', val); }
+    public get dosingTimeRemaining(): number { return this.data.dosingTimeRemaining; }
+    public set dosingTimeRemaining(val: number) { this.setDataVal('dosingTimeRemaining', val); }
+    public get dosingVolumeRemaining(): number { return this.data.dosingVolumeRemaining; }
+    public set dosingVolumeRemaining(val: number) { this.setDataVal('dosingVolumeRemaining', val); }
+    public get volumeDosed(): number { return this.data.volumeDosed; }
+    public set volumeDosed(val: number) { this.setDataVal('volumeDosed', val); }
+    public get dailyVolumeDosed(): number { return this.data.dailyVolumeDosed; }
+    public set dailyVolumeDosed(val: number) { this.setDataVal('dailyVolumeDosed', val); }
+    public get mixTimeRemaining(): number { return this.data.mixTimeRemaining; }
+    public set mixTimeRemaining(val: number) { this.setDataVal('mixTimeRemaining', val); }
+    public get dosingStatus(): number { return typeof (this.data.dosingStatus) !== 'undefined' ? this.data.dosingStatus.val : undefined; }
+    public set dosingStatus(val: number) {
+        if (this.dosingStatus !== val) {
+            this.data.dosingStatus = sys.board.valueMaps.chemControllerDosingStatus.transform(val);
+            this.hasChanged = true;
+        }
+    }
+    public get lockout(): boolean { return utils.makeBool(this.data.lockout); }
+    public set lockout(val: boolean) { this.setDataVal('lockout', val); }
+    public get flowDelay(): boolean { return utils.makeBool(this.data.flowDelay); }
+    public set flowDelay(val: boolean) { this.data.flowDelay = val; }
+    public get manualDosing(): boolean { return utils.makeBool(this.data.manualDosing); }
+    public set manualDosing(val: boolean) { this.setDataVal('manualDosing', val); }
+    public get dailyLimitReached(): boolean { return utils.makeBool(this.data.dailyLimitReached); }
+    public set dailyLimitReached(val: boolean) { this.data.dailyLimitReached = val; }
+    public get tank(): ChemicalTankState { return new ChemicalTankState(this.data, 'tank', this); }
+    public get pump(): ChemicalPumpState { return new ChemicalPumpState(this.data, 'pump', this); }
+    public getExtended() {
+        let chem = this.get(true);
+        chem.tank = this.tank.getExtended();
+        chem.pump = this.pump.getExtended();
+        return chem;
+    }
 
-export class ChemControllerStateWarnings extends EqState {
-    ctor(data): ChemControllerStateWarnings { return new ChemControllerStateWarnings(data, name || 'warnings'); }
+}
+export class ChemicalPhState extends ChemicalState {
+    public initData() {
+        if (typeof this.data.chemType === 'undefined') this.data.chemType === 'acid';
+        super.initData();
+    }
+    public get chemType() { return 'acid'; }
+    public get probe(): ChemicalProbePHState { return new ChemicalProbePHState(this.data, 'probe', this); }
+    public getExtended() {
+        let chem = super.getExtended();
+        chem.probe = this.probe.getExtended();
+        return chem;
+    }
+    public get demand(): number { return this.data.demand || 0; }
+    public set demand(val: number) { this.setDataVal('demand', val); }
+    public get suspendDosing(): boolean {
+        let cc = this.chemController;
+        return cc.alarms.comms !== 0 || cc.alarms.pHProbeFault !== 0 || cc.alarms.pHPumpFault !== 0 || cc.alarms.bodyFault !== 0;
+    }
+}
+export class ChemicalORPState extends ChemicalState {
+    public initData() {
+        if (typeof this.data.probe === 'undefined') this.data.probe = {};
+        if (typeof this.data.chemType === 'undefined') this.data.chemType === 'orp';
+        super.initData();
+    }
+    public get chemType() { return 'orp'; }
+    public get probe() { return new ChemicalProbeORPState(this.data, 'probe', this); }
+    public get suspendDosing(): boolean {
+        let cc = this.chemController;
+        return cc.alarms.comms !== 0 || cc.alarms.orpProbeFault !== 0 || cc.alarms.orpPumpFault !== 0 || cc.alarms.bodyFault !== 0;
+    }
+    public getExtended() {
+        let chem = super.getExtended();
+        chem.probe = this.probe.getExtended();
+        return chem;
+    }
+}
+export class ChemicalFlowSensorState extends ChemicalState {
+    public initData() {
+        if (typeof this.data.state === 'undefined') this.data.state = 0;
+    }
+    public get state(): number { return this.data.state || 0; }
+    public set state(val: number) { this.setDataVal('state', val); }
+}
+export class ChemicalPumpState extends ChildEqState {
+    public initData() {
+        if (typeof this.data.isDosing === 'undefined') this.data.isDosing = false;
+    }
+    public get chemical(): ChemicalState { return this.getParent() as ChemicalState; }
+    public get chemController(): ChemControllerState {
+        let p = this.chemical;
+        return typeof p !== 'undefined' ? p.getParent() as ChemControllerState : undefined;
+    }
+    public get type(): number { return typeof (this.data.type) !== 'undefined' ? this.data.type.val : undefined; }
+    public set type(val: number) {
+        if (this.type !== val) {
+            this.data.type = sys.board.valueMaps.chemPumpTypes.transform(val);
+            this.hasChanged = true;
+        }
+    }
+    public get isDosing(): boolean { return utils.makeBool(this.data.isDosing); }
+    public set isDosing(val: boolean) { this.setDataVal('isDosing', val); }
+    public getExtended() {
+        let pump = this.get(true);
+        pump.type = sys.board.valueMaps.chemPumpTypes.transform(this.type);
+        return pump;
+    }
+}
+export class ChemicalProbeState extends ChildEqState {
+    public initData() {
+        if (typeof this.data.level === 'undefined') this.data.level = null;
+    }
+    public get chemical(): ChemicalState { return this.getParent() as ChemicalState; }
+    public get chemController(): ChemControllerState {
+        let p = this.chemical;
+        return typeof p !== 'undefined' ? p.getParent() as ChemControllerState : undefined;
+    }
+    public get level(): number { return this.data.level; }
+    public set level(val: number) { this.setDataVal('level', val); }
+}
+export class ChemicalProbeORPState extends ChemicalProbeState {
+    public initData() {
+        if (typeof this.data.saltLevel === 'undefined') this.data.saltLevel = 0;
+        super.initData();
+    }
+    public get saltLevel(): number { return this.data.saltLevel; }
+    public set saltLevel(val: number) { this.setDataVal('saltLevel', val); }
+}
+export class ChemicalProbePHState extends ChemicalProbeState {
+    public initData() {
+        if (typeof this.data.temperature === 'undefined') this.data.temperature = 0;
+        super.initData();
+    }
+    public get temperature(): number { return this.data.temperature; }
+    public set temperature(val: number) { this.setDataVal('temperature', val); }
+    public get tempUnits(): number {
+        return typeof (this.data.tempUnits) !== 'undefined' ? this.data.tempUnits.val : undefined;
+    }
+    public set tempUnits(val: number) {
+        if (this.tempUnits !== val) {
+            this.data.tempUnits = sys.board.valueMaps.tempUnits.transform(val);
+            this.hasChanged = true;
+        }
+    }
+}
+export class ChemicalTankState extends ChildEqState {
+    public initData() {
+        if (typeof this.data.level === 'undefined') this.data.level == 0;
+        if (typeof this.data.capacity === 'undefined') this.data.capacity = 0;
+        if (typeof this.data.units === 'undefined') this.data.units = 0;
+        if (typeof this.data.alarmEmptyEnabled === 'undefined') this.data.alarmEmptyEnabled = true;
+        if (typeof this.data.alarmEmptyLevel === 'undefined') this.data.alarmEmptyLevel = 20;
+    }
+    public get chemical(): ChemicalState { return this.getParent() as ChemicalState; }
+    public get chemController(): ChemControllerState {
+        let p = this.chemical;
+        return typeof p !== 'undefined' ? p.getParent() as ChemControllerState : undefined;
+    }
+    public get level(): number { return this.data.level; }
+    public set level(val: number) { this.setDataVal('level', val); }
+    public get capacity(): number { return this.data.capacity; }
+    public set capacity(val: number) { this.setDataVal('capacity', val); }
+    public get alarmEmptyEnabled(): boolean { return this.data.alarmEmptyEnabled; }
+    public set alarmEmptyEnabled(val: boolean) { this.setDataVal('alarmEmptyEnabled', val); }
+    public get alarmEmptyLevel(): number { return this.data.alarmEmptyLevel; }
+    public set alarmEmptyLevel(val: number) { this.setDataVal('alarmEmptyLevel', val); }
+    public get units(): number | any { return typeof this.data.units !== 'undefined' ? this.data.units.val : undefined; }
+    public set units(val: number | any) {
+        let v = sys.board.valueMaps.volumeUnits.encode(val);
+        if (this.units !== v) {
+            this.data.units = sys.board.valueMaps.volumeUnits.transform(val);
+            this.hasChanged = true;
+        }
+    }
+}
+
+
+export class ChemControllerStateWarnings extends ChildEqState {
+    ///ctor(data): ChemControllerStateWarnings { return new ChemControllerStateWarnings(data, name || 'warnings'); }
     public dataName = 'chemControllerWarnings';
     public get waterChemistry(): number { return typeof this.data.waterChemistry === 'undefined' ? undefined : this.data.waterChemistry.val; }
     public set waterChemistry(val: number) {
@@ -1515,14 +1797,14 @@ export class ChemControllerStateWarnings extends EqState {
     public get chlorinatorCommError(): number { return this.data.chlorinatorCommError; }
     public set chlorinatorCommError(val: number) {
         if (this.chlorinatorCommError !== val) {
-            this.data.chlorinatorCommError = sys.board.valueMaps.chemControllerLimits.transform(val);
+            this.data.chlorinatorCommError = sys.board.valueMaps.chemControllerWarnings.transform(val);
             this.hasChanged = true;
         }
     }
 
 }
-export class ChemControllerStateAlarms extends EqState {
-    ctor(data): ChemControllerStateWarnings { return new ChemControllerStateWarnings(data, name || 'alarms'); }
+export class ChemControllerStateAlarms extends ChildEqState {
+    //ctor(data): ChemControllerStateWarnings { return new ChemControllerStateWarnings(data, name || 'alarms'); }
     public dataName = 'chemControllerAlarms';
     public get flow(): number { return typeof this.data.flow === 'undefined' ? undefined : this.data.flow.val; }
     public set flow(val: number) {
@@ -1531,7 +1813,7 @@ export class ChemControllerStateAlarms extends EqState {
             this.hasChanged = true;
         }
     }
-    public get pH(): number { return typeof this.data.pH === 'undefined' ? undefined : this.data.pH.val.pH; }
+    public get pH(): number { return typeof this.data.pH === 'undefined' ? undefined : this.data.pH.val; }
     public set pH(val: number) {
         if (this.pH !== val) {
             this.data.pH = sys.board.valueMaps.chemControllerAlarms.transform(val);
@@ -1546,7 +1828,7 @@ export class ChemControllerStateAlarms extends EqState {
         }
     }
     public get pHTank(): number { return typeof this.data.pHTank === 'undefined' ? undefined : this.data.pHTank.val; }
-    public set pHTank(val: number) { 
+    public set pHTank(val: number) {
         if (this.pHTank !== val) {
             this.data.pHTank = sys.board.valueMaps.chemControllerAlarms.transform(val);
             this.hasChanged = true;
@@ -1566,6 +1848,56 @@ export class ChemControllerStateAlarms extends EqState {
             this.hasChanged = true;
         }
     }
+    public get pHPumpFault(): number { return typeof this.data.pHPumpFault === 'undefined' ? undefined : this.data.pHPumpFault.val; }
+    public set pHPumpFault(val: number) {
+        if (this.pHPumpFault !== val) {
+            this.data.pHPumpFault = sys.board.valueMaps.chemControllerHardwareFaults.transform(val);
+            this.hasChanged = true;
+        }
+    }
+    public get orpPumpFault(): number { return typeof this.data.orpPumpFault === 'undefined' ? undefined : this.data.orpPumpFault.val; }
+    public set orpPumpFault(val: number) {
+        if (this.orpPumpFault !== val) {
+            this.data.orpPumpFault = sys.board.valueMaps.chemControllerHardwareFaults.transform(val);
+            this.hasChanged = true;
+        }
+    }
+    public get pHProbeFault(): number { return typeof this.data.pHProbeFault === 'undefined' ? undefined : this.data.pHProbeFault.val; }
+    public set pHProbeFault(val: number) {
+        if (this.pHProbeFault !== val) {
+            this.data.pHProbeFault = sys.board.valueMaps.chemControllerHardwareFaults.transform(val);
+            this.hasChanged = true;
+        }
+    }
+    public get orpProbeFault(): number { return typeof this.data.orpProbeFault === 'undefined' ? undefined : this.data.orpProbeFault.val; }
+    public set orpProbeFault(val: number) {
+        if (this.orpProbeFault !== val) {
+            this.data.orpProbeFault = sys.board.valueMaps.chemControllerHardwareFaults.transform(val);
+            this.hasChanged = true;
+        }
+    }
+    public get chlorFault(): number { return typeof this.data.chlorFault === 'undefined' ? undefined : this.data.chlorFault.val; }
+    public set chlorFault(val: number) {
+        if (this.chlorFault !== val) {
+            this.data.chlorFault = sys.board.valueMaps.chemControllerHardwareFaults.transform(val);
+            this.hasChanged = true;
+        }
+    }
+    public get bodyFault(): number { return typeof this.data.bodyFault === 'undefined' ? undefined : this.data.bodyFault.val; }
+    public set bodyFault(val: number) {
+        if (this.bodyFault !== val) {
+            this.data.bodyFault = sys.board.valueMaps.chemControllerHardwareFaults.transform(val);
+            this.hasChanged = true;
+        }
+    }
+    public get flowSensorFault(): number { return typeof this.data.flowSensorFault === 'undefined' ? undefined : this.data.flowSensorFault.val; }
+    public set flowSensorFault(val: number) {
+        if (this.flowSensorFault !== val) {
+            this.data.flowSensorFault = sys.board.valueMaps.chemControllerHardwareFaults.transform(val);
+            this.hasChanged = true;
+        }
+    }
+
     public get comms(): number { return typeof this.data.comms === 'undefined' ? undefined : this.data.comms.val; }
     public set comms(val: number) {
         if (this.comms !== val) {
@@ -1574,7 +1906,7 @@ export class ChemControllerStateAlarms extends EqState {
         }
     }
 }
-export class AppVersionState extends EqState{
+export class AppVersionState extends EqState {
     public get nextCheckTime(): string { return this.data.nextCheckTime; }
     public set nextCheckTime(val: string) { this.setDataVal('nextCheckTime', val); }
     public get isDismissed(): boolean { return this.data.isDismissed; }
@@ -1584,7 +1916,7 @@ export class AppVersionState extends EqState{
     public get githubRelease(): string { return this.data.githubRelease; }
     public set githubRelease(val: string) { this.setDataVal('githubRelease', val); }
     public get status(): number { return typeof this.data.status === 'undefined' ? undefined : this.data.status.val; }
-    public set status(val: number) { 
+    public set status(val: number) {
         if (this.status !== val) {
             this.data.status = sys.board.valueMaps.appVersionStatus.transform(val);
             this.hasChanged = true;
@@ -1594,5 +1926,37 @@ export class AppVersionState extends EqState{
 export class CommsState {
     public keepAlives: number;
 }
+export class FilterStateCollection extends EqStateCollection<FilterState> {
+    public createItem(data: any): FilterState { return new FilterState(data); }
+}
+export class FilterState extends EqState {
+    public dataName: string = 'filter';
+    public get id(): number { return this.data.id; }
+    public set id(val: number) { this.data.id = val; }
+    public get name(): string { return this.data.name; }
+    public set name(val: string) { this.setDataVal('name', val); }
+    public get body(): number { return typeof (this.data.body) !== 'undefined' ? this.data.body.val : -1; }
+    public set body(val: number) {
+        if (this.body !== val) {
+            this.data.body = sys.board.valueMaps.bodies.transform(val);
+            this.hasChanged = true;
+        }
+    }
+    public get filterType(): number { return typeof this.data.filterType === 'undefined' ? undefined : this.data.filterType.val; }
+    public set filterType(val: number) {
+        if (this.filterType !== val) {
+            this.data.filterType = sys.board.valueMaps.filterTypes.transform(val);
+            this.hasChanged = true;
+        }
+    }
+    public get psi(): number { return this.data.psi; }
+    public set psi(val: number) { this.setDataVal('psi', val); }
+    public get filterPsi(): number { return this.data.filterPsi; } // do not exceed value.  
+    public set filterPsi(val: number) { this.setDataVal('filterPsi', val); }
+    public get lastCleanDate(): Timestamp { return this.data.lastCleanDate; }
+    public set lastCleanDate(val: Timestamp) { this.setDataVal('lastCleanDate', val); }
+    public get needsCleaning(): number { return this.data.needsCleaning; }
+    public set needsCleaning(val: number) { this.setDataVal('needsCleaning', val); }
 
+}
 export var state = new State();

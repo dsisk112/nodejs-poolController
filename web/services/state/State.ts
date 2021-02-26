@@ -28,8 +28,22 @@ export class StateRoute {
         });
         app.put('/state/chemController', async (req, res, next) => {
             try {
-                let schem = await sys.board.chemControllers.setChemControllerAsync(req.body);
-                return res.status(200).send(state.chemControllers.getItemById(schem.id).getExtended());
+                let schem = await sys.board.chemControllers.setChemControllerStateAsync(req.body);
+                return res.status(200).send(schem.getExtended());
+            }
+            catch (err) { next(err); }
+        });
+        app.put('/state/chemController/manualDose', async (req, res, next) => {
+            try {
+                let schem = await sys.board.chemControllers.manualDoseAsync(req.body);
+                return res.status(200).send(schem.getExtended());
+            }
+            catch (err) { next(err); }
+        });
+        app.put('/state/chemController/cancelDosing', async (req, res, next) => {
+            try {
+                let schem = await sys.board.chemControllers.cancelDosingAsync(req.body);
+                return res.status(200).send(schem.getExtended());
             }
             catch (err) { next(err); }
         });
@@ -39,6 +53,13 @@ export class StateRoute {
         app.get('/state/circuit/:id', (req, res) => {
             res.status(200).send(state.circuits.getItemById(parseInt(req.params.id, 10)).get());
         });
+        app.get('/state/feature/:id', (req, res) => {
+            res.status(200).send(state.features.getItemById(parseInt(req.params.id, 10)).get());
+        });
+        app.get('/state/circuitGroup/:id', (req, res) => {
+            res.status(200).send(state.circuitGroups.getItemById(parseInt(req.params.id, 10)).get());
+        });
+
         app.get('/state/pump/:id', (req, res) => {
             // todo: need getInterfaceById.get() for features
             let pump = state.pumps.getItemById(parseInt(req.params.id, 10));
@@ -190,9 +211,12 @@ export class StateRoute {
             }
             catch (err) { next(err); }
         });
-        app.put('/state/cancelDelay', (req, res) => {
-            state.equipment.cancelDelay();
-            return res.status(200).send('OK');
+        app.put('/state/cancelDelay', async (req, res, next) => {
+            try {
+                let delay = await sys.board.system.cancelDelay();
+                return res.status(200).send(delay);
+            }
+            catch (err) { next(err); }
         });
         app.put('/state/lightGroup/:id/colorSync', async (req, res, next) => {
             try {

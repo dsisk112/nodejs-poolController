@@ -24,16 +24,18 @@ import { sys, ControllerType } from "./controller/Equipment";
 import { state } from "./controller/State";
 import { webApp } from "./web/Server";
 import * as readline from 'readline';
+import { ncp } from "./controller/nixie/Nixie";
 
 export async function initAsync() {
     return Promise.resolve()
-        .then(function() { config.init(); })
-        .then(function() { logger.init(); })
-        .then(function() { conn.init(); })
+        .then(function () { config.init(); })
+        .then(function () { logger.init(); })
+        .then(function () { conn.init(); })
         //.then(function () { }) Add in any initialization for no controller board here but I think we have that covered with the standard SystemBoard object.
-        .then(function() { state.init(); })
-        .then(function() { sys.init(); })
-        .then(function() { webApp.init(); });
+        .then(function () { state.init(); })
+        .then(function () { sys.init(); })
+        .then(function () { webApp.init(); })
+        .then(function () { ncp.initAsync(sys); });
 }
 
 export async function startPacketCapture(bResetLogs: boolean) {
@@ -60,11 +62,14 @@ export async function stopAsync(): Promise<void> {
     try {
         console.log('Shutting down open processes');
         // await sys.board.virtualPumpControllers.stopAsync();
-        await logger.stopAsync();
         await sys.stopAsync();
         await state.stopAsync();
         await conn.stopAsync();
+        await webApp.stopAsync();
         config.update();
+        await logger.stopAsync();
+        // RKS: Uncomment below to see the shutdown process
+        //await new Promise((resolve, reject) => { setTimeout(() => { resolve(); }, 10000); });
     }
     catch (err) {
         console.error(`Error stopping processes: ${ err.message }`);
@@ -75,10 +80,14 @@ export async function stopAsync(): Promise<void> {
 }
 if (process.platform === 'win32') {
     let rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-    rl.on('SIGINT', async function() { stopAsync(); });
+    rl.on('SIGINT', async function () {
+        try { await stopAsync(); } catch (err) { console.log(`Error shutting down processes ${err.message}`); }
+    });
 }
 else {
-    process.stdin.resume()
-    process.on('SIGINT', async function() { return stopAsync(); });
+    process.stdin.resume();
+    process.on('SIGINT', async function () {
+        try { return await stopAsync(); } catch (err) { console.log(`Error shutting down processes ${err.message}`); }
+    });
 }
 initAsync();
